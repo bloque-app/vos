@@ -70,6 +70,38 @@ const MAX_EXECUTION_FETCH_BYTES: usize = MAX_EXECUTION_STATE_TOTAL_BYTES
 const MAX_EXECUTION_BLAKE2B_COMPRESS_CALLS: usize =
     1024 + MAX_EXECUTION_AVAILABILITY_BYTES.div_ceil(128) + 2 * MAX_EXECUTION_BLOBS;
 const MAX_EXECUTION_DEBUG_BYTES: usize = 16 * 1024;
+/// Actor gas charged for one constrained curve precompile ECALL (110-114)
+/// before the runtime executes it. The runtime computes the operation as its
+/// own interpreted guest code; charging the caller at least that interpreted
+/// cost keeps the work inside the actor's declared gas, so the outer budget
+/// (management gas plus the work's own gas) always covers it. Each value is
+/// the operation's interpreted gas, measured on this crate's curve25519-dalek
+/// release built with the runtime's toolchain, target and release profile
+/// (3.92 M, 449 k, 12.1 k, 26.3 k and 22.8 k gas), plus about 15 %.
+#[cfg(feature = "agent-runtime")]
+const CURVE_PRECOMPILE_GAS: [u64; 5] = [
+    CURVE_SCALAR_MULT_GAS,
+    CURVE_POINT_ADD_GAS,
+    CURVE_SCALAR_WIDE_GAS,
+    CURVE_SCALAR_MUL_GAS,
+    CURVE_SCALAR_ADD_GAS,
+];
+#[cfg(feature = "agent-runtime")]
+const CURVE_SCALAR_MULT_GAS: u64 = 4_500_000;
+#[cfg(feature = "agent-runtime")]
+const CURVE_POINT_ADD_GAS: u64 = 520_000;
+#[cfg(feature = "agent-runtime")]
+const CURVE_SCALAR_WIDE_GAS: u64 = 14_000;
+#[cfg(feature = "agent-runtime")]
+const CURVE_SCALAR_MUL_GAS: u64 = 30_000;
+#[cfg(feature = "agent-runtime")]
+const CURVE_SCALAR_ADD_GAS: u64 = 26_000;
+/// First and last constrained curve precompile ECALL, matching
+/// `vos_pvm_precompiles::ECALL_RISTRETTO_SCALAR_MULT..=ECALL_SCALAR_ADD_MOD_L`.
+#[cfg(feature = "agent-runtime")]
+const ECALL_CURVE_FIRST: u64 = 110;
+#[cfg(feature = "agent-runtime")]
+const ECALL_CURVE_LAST: u64 = 114;
 
 #[cfg(feature = "pvm")]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1202,6 +1234,29 @@ pub(crate) fn run_inner_actor_with_storage(
                         // actor code reads the digest through `h_address`.
                         (registers[7], registers[8])
                     }
+                    // Constrained Ristretto/scalar precompiles are memory
+                    // transforms computed as runtime guest code, byte-for-byte
+                    // the shims' host fallback. The actor pays their gas first.
+                    #[cfg(feature = "agent-runtime")]
+                    value if (ECALL_CURVE_FIRST..=ECALL_CURVE_LAST).contains(&value) => {
+                        let price = CURVE_PRECOMPILE_GAS[(value - ECALL_CURVE_FIRST) as usize];
+                        let Some(remaining) = gas.checked_sub(price) else {
+                            return Ok(ActorRunOutcome::Completed {
+                                reply: terminal_reply(
+                                    invocation,
+                                    ActorExecutionStatus::OutOfGas,
+                                    0,
+                                ),
+                                state: actor_state.clone(),
+                                rows: Vec::new(),
+                            });
+                        };
+                        gas = remaining;
+                        curve_precompile(&mut machine, value, &registers)?;
+                        // Like BLAKE2b, preserve the argument registers; the
+                        // result is only the bytes written through the pointer.
+                        (registers[7], registers[8])
+                    }
                     // Guest diagnostics never cross the deterministic runtime
                     // boundary. Validate the readable window, then discard it.
                     value if value == u64::from(hostcall::DEBUG_WRITE) => {
@@ -1242,6 +1297,83 @@ pub(crate) fn run_inner_actor_with_storage(
             }
         }
     }
+}
+
+/// Execute one constrained curve precompile ECALL against the actor's memory.
+///
+/// ABI (as `vos_pvm_precompiles` emits it): φ[7], φ[8], φ[9] are pointers.
+/// Scalar mult, point add, scalar mul and scalar add read two 32-byte operands
+/// at φ[7] and φ[8] and write 32 bytes at φ[9]; the wide reduction reads 64
+/// bytes at φ[7] and writes 32 bytes at φ[8]. A non-canonical scalar or an
+/// invalid point encoding yields the all-zero sentinel, exactly as the shims'
+/// host fallback and the prover's tracer. An unreadable or unwritable pointer
+/// is invalid input, as for BLAKE2b.
+#[cfg(feature = "agent-runtime")]
+fn curve_precompile(
+    machine: &mut super::machine::ActorMachine,
+    id: u64,
+    registers: &[u64; vos_pvm_program::REGISTER_COUNT],
+) -> Result<(), ActorExecutionError> {
+    use curve25519_dalek::ristretto::CompressedRistretto;
+    use curve25519_dalek::scalar::Scalar;
+
+    let pointer = |index: usize| {
+        u32::try_from(registers[index]).map_err(|_| ActorExecutionError::InvalidInput)
+    };
+    fn read32(
+        machine: &super::machine::ActorMachine,
+        address: u32,
+    ) -> Result<[u8; 32], ActorExecutionError> {
+        let mut bytes = [0u8; 32];
+        machine
+            .read(address, &mut bytes)
+            .map_err(|_| ActorExecutionError::InvalidInput)?;
+        Ok(bytes)
+    }
+    let scalar = |bytes: [u8; 32]| Scalar::from_canonical_bytes(bytes).into_option();
+    let point = |bytes: [u8; 32]| {
+        CompressedRistretto::from_slice(&bytes)
+            .ok()
+            .and_then(|compressed| compressed.decompress())
+    };
+    let (output_register, output) = match id {
+        110 => {
+            let (k, p) = (read32(machine, pointer(7)?)?, read32(machine, pointer(8)?)?);
+            let output = match (scalar(k), point(p)) {
+                (Some(k), Some(p)) => (k * p).compress().to_bytes(),
+                _ => [0u8; 32],
+            };
+            (9, output)
+        }
+        111 => {
+            let (p, q) = (read32(machine, pointer(7)?)?, read32(machine, pointer(8)?)?);
+            let output = match (point(p), point(q)) {
+                (Some(p), Some(q)) => (p + q).compress().to_bytes(),
+                _ => [0u8; 32],
+            };
+            (9, output)
+        }
+        112 => {
+            let mut wide = [0u8; 64];
+            machine
+                .read(pointer(7)?, &mut wide)
+                .map_err(|_| ActorExecutionError::InvalidInput)?;
+            (8, Scalar::from_bytes_mod_order_wide(&wide).to_bytes())
+        }
+        113 | 114 => {
+            let (a, b) = (read32(machine, pointer(7)?)?, read32(machine, pointer(8)?)?);
+            let output = match (scalar(a), scalar(b)) {
+                (Some(a), Some(b)) if id == 113 => (a * b).to_bytes(),
+                (Some(a), Some(b)) => (a + b).to_bytes(),
+                _ => [0u8; 32],
+            };
+            (9, output)
+        }
+        _ => return Err(ActorExecutionError::UnsupportedHostCall(id)),
+    };
+    machine
+        .write(pointer(output_register)?, &output)
+        .map_err(|_| ActorExecutionError::InvalidInput)
 }
 
 #[cfg(feature = "pvm")]
@@ -3090,6 +3222,135 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// T-025-02: an actor built with the constrained curve precompile shims
+    /// runs on the Agent path. Each ECALL 110-114 writes exactly the shims'
+    /// host-fallback bytes (the all-zero sentinel on invalid input), keeps
+    /// its argument registers, and is charged to the actor's gas first.
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn inner_curve_precompiles_match_host_fallback_and_charge_actor_gas() {
+        use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+        use curve25519_dalek::scalar::Scalar;
+        use vos_pvm_compiler::assembler::{Assembler, Reg};
+
+        let base = u64::from(2 * vos_pvm::PVM_ZONE_SIZE);
+        // Reply: five 32-byte outputs, then the preserved a0 of each call.
+        const REPLY: usize = 5 * 32 + 5 * 8;
+        let run = |scalar: [u8; 32], point: [u8; 32], gas: u64| {
+            let point2 = (Scalar::from(7u64) * RISTRETTO_BASEPOINT_POINT)
+                .compress()
+                .to_bytes();
+            let wide = [0xa5u8; 64];
+            let (a, b) = (
+                Scalar::from(11u64).to_bytes(),
+                Scalar::from(13u64).to_bytes(),
+            );
+            let mut data = actor_output([0, 0, 0], REPLY);
+            let inputs = data.len() as u64;
+            for part in [&scalar[..], &point, &point2, &wide, &a, &b] {
+                data.extend_from_slice(part);
+            }
+            let at = |offset: u64| base + inputs + offset;
+            let out = |index: u64| base + 13 + 32 * index;
+            let kept = |index: u64| base + 13 + 160 + 8 * index;
+            let mut program = Assembler::new();
+            program.set_rw_data(data);
+            for (index, id, args) in [
+                (0, 110, [at(0), at(32), out(0)]),
+                (1, 111, [at(32), at(64), out(1)]),
+                (2, 112, [at(96), out(2), 0]),
+                (3, 113, [at(160), at(192), out(3)]),
+                (4, 114, [at(160), at(192), out(4)]),
+            ] {
+                program
+                    .load_imm_64(Reg::A0, args[0])
+                    .load_imm_64(Reg::A1, args[1])
+                    .load_imm_64(Reg::A2, args[2])
+                    .ecalli(id)
+                    .store_u64(Reg::A0, u32::try_from(kept(index)).unwrap());
+            }
+            program
+                .load_imm_64(Reg::A0, base)
+                .load_imm_64(Reg::A1, (13 + REPLY) as u64)
+                .jump_ind(Reg::RA, 0);
+            let mut call = invocation();
+            call.gas = gas;
+            let ActorRunOutcome::Completed { reply, .. } = run_inner_actor(
+                &call,
+                None,
+                &program.build_standard(),
+                None,
+                &ActorStateLanes::default(),
+                None,
+            )
+            .unwrap() else {
+                panic!("curve precompiles yielded")
+            };
+            (reply, [at(0), at(32), at(96), at(160), at(160)])
+        };
+
+        let scalar = Scalar::from(5u64).to_bytes();
+        let point = (Scalar::from(3u64) * RISTRETTO_BASEPOINT_POINT)
+            .compress()
+            .to_bytes();
+        let priced: u64 = CURVE_PRECOMPILE_GAS.iter().sum();
+        let (reply, pointers) = run(scalar, point, priced + 10_000);
+        assert_eq!(reply.status, ActorExecutionStatus::Done);
+        let point2 = (Scalar::from(7u64) * RISTRETTO_BASEPOINT_POINT)
+            .compress()
+            .to_bytes();
+        let (a, b) = (
+            Scalar::from(11u64).to_bytes(),
+            Scalar::from(13u64).to_bytes(),
+        );
+        let expected = [
+            vos_pvm_precompiles::ristretto_scalar_mult(&scalar, &point),
+            vos_pvm_precompiles::ristretto_point_add(&point, &point2),
+            vos_pvm_precompiles::scalar_from_bytes_mod_order_wide(&[0xa5; 64]),
+            vos_pvm_precompiles::scalar_mul_mod_l(&a, &b),
+            vos_pvm_precompiles::scalar_add_mod_l(&a, &b),
+        ];
+        for (index, expected) in expected.iter().enumerate() {
+            assert_eq!(
+                &reply.reply[32 * index..32 * index + 32],
+                expected,
+                "op {index}"
+            );
+        }
+        assert_eq!(
+            &reply.reply[..32],
+            &(Scalar::from(15u64) * RISTRETTO_BASEPOINT_POINT)
+                .compress()
+                .to_bytes()
+        );
+        for (index, pointer) in pointers.into_iter().enumerate() {
+            let at = 160 + 8 * index;
+            assert_eq!(
+                u64::from_le_bytes(reply.reply[at..at + 8].try_into().unwrap()),
+                pointer,
+                "argument register of op {index} preserved"
+            );
+        }
+        assert!(
+            reply.gas_remaining < 10_000,
+            "the five operations were charged to the actor's gas"
+        );
+
+        // A non-canonical scalar and an invalid point yield the sentinel.
+        let (reply, _) = run([0xff; 32], [0xff; 32], priced + 10_000);
+        assert_eq!(reply.status, ActorExecutionStatus::Done);
+        assert_eq!(&reply.reply[..32], &[0u8; 32]);
+        assert_eq!(&reply.reply[32..64], &[0u8; 32]);
+        assert_eq!(
+            vos_pvm_precompiles::ristretto_scalar_mult(&[0xff; 32], &[0xff; 32]),
+            [0u8; 32]
+        );
+
+        // Too little gas for the first operation: OutOfGas, nothing computed.
+        let (reply, _) = run(scalar, point, CURVE_SCALAR_MULT_GAS - 1);
+        assert_eq!(reply.status, ActorExecutionStatus::OutOfGas);
     }
 
     #[cfg(feature = "pvm")]

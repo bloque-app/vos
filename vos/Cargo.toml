@@ -24,7 +24,7 @@ native-extension-client = ["pvm"]
 # The bundled agent runtime is an infrastructure guest like the former
 # service runtime, but it uses only the standard PVM inner-machine surface.
 # Keep its larger transient arena out of ordinary application actors.
-agent-runtime = ["pvm", "dep:ed25519-dalek"]
+agent-runtime = ["pvm", "dep:ed25519-dalek", "dep:curve25519-dalek"]
 experimental-state-blocks = ["vos-agent-sdk/experimental-state-blocks"]
 # Host-side same-run Standard Refine execution, proving, bounded proof
 # material, and deterministic replay verification. Kept opt-in so ordinary
@@ -135,6 +135,11 @@ libc = { version = "0.2", optional = true }
 fs2 = { version = "0.4", optional = true }
 blake2b_simd = { version = "1", default-features = false }
 ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"], optional = true }
+# Guest-side execution of the constrained Ristretto/scalar precompile ECALLs
+# (110-114) for Agent actors. The standard AgentRuntime keeps no private
+# outer-host ABI, so it computes them as deterministic guest code, as it does
+# BLAKE2b. The same crate and major version the precompile shims fall back to.
+curve25519-dalek = { version = "4.1", default-features = false, optional = true }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"], optional = true }
 hkdf = { version = "0.12", default-features = false, optional = true }
 rand_core = { version = "0.6", features = ["getrandom"], optional = true }
