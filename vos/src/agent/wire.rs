@@ -9579,10 +9579,17 @@ pub(crate) mod tests {
     fn clean_resolvable_fixture(
         alias_artifact_roles: bool,
     ) -> (StandardAgentRuntime, crate::agent_sdk::InvocationWork) {
+        clean_resolvable_fixture_with_program(alias_artifact_roles, b"clean-program".to_vec())
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_resolvable_fixture_with_program(
+        alias_artifact_roles: bool,
+        program_bytes: Vec<u8>,
+    ) -> (StandardAgentRuntime, crate::agent_sdk::InvocationWork) {
         let mut state = clean_sparse_standard_state();
         let config = state.config.as_ref().unwrap().clone();
         let actor = &mut state.actors[0].record;
-        let program_bytes = b"clean-program".to_vec();
         let schema_bytes = if alias_artifact_roles {
             program_bytes.clone()
         } else {
@@ -9682,6 +9689,45 @@ pub(crate) mod tests {
             runtime.resolve_clean_invocation(&work),
             Err(crate::agent_sdk::InvocationError::InvalidInput)
         ));
+    }
+
+    /// Declared actors may exceed the standard program size up to the
+    /// runtime's hard maximum; nothing larger is ever resolved as a program.
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_resolver_executes_declared_programs_up_to_the_hard_maximum() {
+        let standard = crate::agent_sdk::STANDARD_ACTOR_PROGRAM_BYTES;
+        let maximum = crate::agent_sdk::MAX_RUNTIME_PROGRAM_BYTES;
+        assert_eq!(
+            super::super::execution::MAX_EXECUTION_PROGRAM_BYTES,
+            maximum
+        );
+        for (len, resolves) in [
+            (standard, true),
+            (standard + 1, true),
+            (maximum, true),
+            (maximum + 1, false),
+        ] {
+            let program = vec![0x6b; len];
+            let (runtime, work) = clean_resolvable_fixture_with_program(false, program.clone());
+            // The work is well formed either way; only the runtime decides
+            // what may be executed as the actor's program.
+            assert!(work.validate(), "{len} B");
+            match runtime.resolve_clean_invocation(&work) {
+                Ok((_, resolved, ..)) => {
+                    assert!(resolves, "{len} B resolved");
+                    assert_eq!(resolved, program);
+                }
+                Err(error) => {
+                    assert!(!resolves, "{len} B refused: {error:?}");
+                    assert!(matches!(
+                        error,
+                        crate::agent_sdk::InvocationError::InvalidAvailability
+                            | crate::agent_sdk::InvocationError::InvalidInput
+                    ));
+                }
+            }
+        }
     }
 
     #[cfg(feature = "pvm")]

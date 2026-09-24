@@ -7629,6 +7629,7 @@ mod tests {
                         scheduling: false,
                         proof_systems: ProofSystemSet::EMPTY,
                     },
+                    resources: None,
                     signing: PackageSigning {
                         producer: ProducerId::of_public_key(&public_key),
                         public_key,
@@ -7811,6 +7812,7 @@ mod tests {
                         scheduling: false,
                         proof_systems: ProofSystemSet::EMPTY,
                     },
+                    resources: None,
                     signing: PackageSigning {
                         producer: ProducerId::of_public_key(&public_key),
                         public_key,
@@ -8391,6 +8393,7 @@ mod tests {
                         scheduling: false,
                         proof_systems: ProofSystemSet::EMPTY,
                     },
+                    resources: None,
                     signing: PackageSigning {
                         producer: ProducerId::of_public_key(&public_key),
                         public_key,

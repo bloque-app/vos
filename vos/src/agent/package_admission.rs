@@ -10,8 +10,8 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use vos_agent_sdk::package::{
-    ActorPackageManifest, AgentRuntimePackageManifest, PackageEnvelope, PackageError,
-    PackageManifest, PackageVerifier,
+    ActorPackageManifest, ActorResources, AgentRuntimePackageManifest, PackageEnvelope,
+    PackageError, PackageManifest, PackageVerifier,
 };
 use vos_agent_sdk::{
     AgentProfile, BlobRef, DeploymentId, ProducerId, ProgramId, RuntimeCapabilities,
@@ -32,6 +32,11 @@ pub enum PackageAdmissionError {
     UnsupportedRuntimeContract,
     UnsupportedProfile,
     IncompatibleRuntime,
+    /// The declared resources differ from what the actor program encodes.
+    ResourceDeclarationMismatch,
+    /// The actor exceeds the installing owner's ceilings, or exceeds the
+    /// standard actor profile without declaring its resources.
+    ResourceCeiling,
 }
 
 impl fmt::Display for PackageAdmissionError {
@@ -64,6 +69,12 @@ impl fmt::Display for PackageAdmissionError {
             Self::IncompatibleRuntime => {
                 formatter.write_str("VOS3 actor package is incompatible with the AgentRuntime")
             }
+            Self::ResourceDeclarationMismatch => formatter.write_str(
+                "VOS3 actor resource declaration differs from its standard program",
+            ),
+            Self::ResourceCeiling => formatter.write_str(
+                "VOS3 actor exceeds the installation's resource ceilings or must declare its resources",
+            ),
         }
     }
 }
@@ -227,15 +238,109 @@ impl AdmittedRuntimePackage {
     }
 }
 
+/// Ceilings an Agent's owner admits a new actor installation under.
+///
+/// These are installation policy, applied where an owner submits an Install
+/// ([`admit_actor_package_within`]). They are deliberately not applied when a
+/// host re-admits a package it already retained (replay, recovery): that path
+/// must decide exactly as it did when the package was first installed, so
+/// [`admit_actor_package`] depends only on the package bytes. The runtime's
+/// own hard maximum, [`vos_agent_sdk::MAX_RUNTIME_PROGRAM_BYTES`], is part of
+/// the runtime program and applies at every execution regardless.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActorResourceCeilings {
+    pub max_program_bytes: u32,
+    pub max_heap_bytes: u32,
+    pub max_stack_bytes: u32,
+}
+
+impl ActorResourceCeilings {
+    /// The standard actor profile: today's program limit, and heap and stack
+    /// as any standard program header may encode them.
+    pub const fn standard() -> Self {
+        Self {
+            max_program_bytes: vos_agent_sdk::STANDARD_ACTOR_PROGRAM_BYTES as u32,
+            max_heap_bytes: ActorResources::MAX_HEAP_BYTES,
+            max_stack_bytes: ActorResources::MAX_STACK_BYTES,
+        }
+    }
+
+    /// The largest ceilings the runtime executes under.
+    pub const fn runtime_maximum() -> Self {
+        Self {
+            max_program_bytes: vos_agent_sdk::MAX_RUNTIME_PROGRAM_BYTES as u32,
+            ..Self::standard()
+        }
+    }
+
+    pub const fn is_valid(self) -> bool {
+        self.max_program_bytes != 0
+            && self.max_program_bytes as usize <= vos_agent_sdk::MAX_RUNTIME_PROGRAM_BYTES
+            && self.max_heap_bytes <= ActorResources::MAX_HEAP_BYTES
+            && self.max_stack_bytes <= ActorResources::MAX_STACK_BYTES
+    }
+
+    /// Whether an actor with these exact program resources may be installed.
+    /// Above the standard program size the package must declare them.
+    pub const fn admits(self, resources: ActorResources, declared: bool) -> bool {
+        self.is_valid()
+            && (declared
+                || resources.program_bytes as usize <= vos_agent_sdk::STANDARD_ACTOR_PROGRAM_BYTES)
+            && resources.program_bytes <= self.max_program_bytes
+            && resources.heap_bytes <= self.max_heap_bytes
+            && resources.stack_bytes <= self.max_stack_bytes
+    }
+}
+
+/// What a standard actor program itself fixes: its length, its zero pages
+/// (the actor's heap, including its allocator arena) and its stack. `None`
+/// when the bytes are not an executor-valid standard program. A package's
+/// [`ActorResources`] declaration must equal this.
+pub fn actor_program_resources(program: &[u8]) -> Option<ActorResources> {
+    let standard = vos_pvm::spi::parse_standard_program(program)?;
+    Some(ActorResources {
+        program_bytes: u32::try_from(program.len()).ok()?,
+        heap_bytes: standard.heap_pages * ActorResources::PAGE_BYTES,
+        stack_bytes: standard.stack_size,
+    })
+}
+
 /// Admit exactly one VOS3 AgentActor envelope.
+///
+/// A resource declaration, when present, must restate the program exactly.
+/// No ceiling is applied here; see [`ActorResourceCeilings`].
 pub fn admit_actor_package(bytes: &[u8]) -> Result<AdmittedActorPackage, PackageAdmissionError> {
+    admit_actor_package_inner(bytes).map(|(package, _)| package)
+}
+
+/// Admit a VOS3 AgentActor envelope for a new installation under the
+/// installing owner's `ceilings`.
+pub fn admit_actor_package_within(
+    bytes: &[u8],
+    ceilings: ActorResourceCeilings,
+) -> Result<AdmittedActorPackage, PackageAdmissionError> {
+    let (package, resources) = admit_actor_package_inner(bytes)?;
+    if !ceilings.admits(resources, package.manifest().resources.is_some()) {
+        return Err(PackageAdmissionError::ResourceCeiling);
+    }
+    Ok(package)
+}
+
+fn admit_actor_package_inner(
+    bytes: &[u8],
+) -> Result<(AdmittedActorPackage, ActorResources), PackageAdmissionError> {
     let envelope = decode_and_verify(bytes)?;
     let PackageManifest::Actor(manifest) = &envelope.manifest else {
         return Err(PackageAdmissionError::WrongKind);
     };
     let program_bytes = artifact_bytes(&envelope, &manifest.program)?;
-    if vos_pvm::spi::parse_standard_program(program_bytes).is_none() {
-        return Err(PackageAdmissionError::InvalidActorProgram);
+    let resources =
+        actor_program_resources(program_bytes).ok_or(PackageAdmissionError::InvalidActorProgram)?;
+    if manifest
+        .resources
+        .is_some_and(|declared| declared != resources)
+    {
+        return Err(PackageAdmissionError::ResourceDeclarationMismatch);
     }
     let program = ProgramId::of_pvm(program_bytes);
     let tasks = envelope.task_dependency_set()?;
@@ -247,13 +352,16 @@ pub fn admit_actor_package(bytes: &[u8]) -> Result<AdmittedActorPackage, Package
     }
     let package = BlobRef::of_bytes(bytes);
     let deployment = envelope.deployment_id()?;
-    Ok(AdmittedActorPackage {
-        envelope,
-        exact_bytes: bytes.to_vec(),
-        package,
-        deployment,
-        program,
-    })
+    Ok((
+        AdmittedActorPackage {
+            envelope,
+            exact_bytes: bytes.to_vec(),
+            package,
+            deployment,
+            program,
+        },
+        resources,
+    ))
 }
 
 /// Admit exactly one VOS3 AgentRuntime envelope.
@@ -583,6 +691,7 @@ fn admitted_standard_actor_fixture(
                 scheduling: false,
                 proof_systems: ProofSystemSet::EMPTY,
             },
+            resources: None,
             signing: package_signing,
         }),
         artifacts,
@@ -961,6 +1070,14 @@ pub(super) mod tests {
         } else {
             b"not a standard actor PVM".to_vec()
         };
+        actor_package_with(fixture, actor_program, None)
+    }
+
+    fn actor_package_with(
+        fixture: ActorFixture,
+        actor_program: Vec<u8>,
+        resources: Option<ActorResources>,
+    ) -> PackageEnvelope {
         let fields = fixture
             .lane
             .map(|lane| {
@@ -1047,10 +1164,144 @@ pub(super) mod tests {
                     scheduling: fixture.scheduling,
                     proof_systems,
                 },
+                resources,
                 signing: signing(),
             }),
             artifacts,
         })
+    }
+
+    /// A parseable standard program of exactly `bytes` bytes, padded with
+    /// read-only data, with the given zero pages and stack.
+    fn sized_program(bytes: usize, heap_pages: u32, stack_size: u32) -> Vec<u8> {
+        let build = |ro_len: usize| {
+            vos_pvm_program::build_standard_program(&vos_pvm_program::StandardProgram {
+                ro_data: vec![0x5a; ro_len],
+                rw_data: Vec::new(),
+                heap_pages,
+                stack_size,
+                code: vos_pvm_program::CodeBlob {
+                    jump_table: Vec::new(),
+                    code: vec![0],
+                    bitmask: vec![1],
+                },
+            })
+            .unwrap()
+        };
+        let program = build(bytes - build(0).len());
+        assert_eq!(program.len(), bytes);
+        assert!(vos_pvm::spi::parse_standard_program(&program).is_some());
+        program
+    }
+
+    #[test]
+    fn actor_over_the_standard_program_installs_only_when_declared_and_admitted() {
+        const STANDARD: usize = vos_agent_sdk::STANDARD_ACTOR_PROGRAM_BYTES;
+        const MAXIMUM: usize = vos_agent_sdk::MAX_RUNTIME_PROGRAM_BYTES;
+        const HEAP_PAGES: u32 = 64;
+        const STACK: u32 = 256 * 1024;
+        // Between the standard profile and the runtime's hard maximum.
+        let program = sized_program((STANDARD + MAXIMUM) / 2, HEAP_PAGES, STACK);
+        let exact = ActorResources {
+            program_bytes: program.len() as u32,
+            heap_bytes: HEAP_PAGES * ActorResources::PAGE_BYTES,
+            stack_bytes: STACK,
+        };
+        let package = |resources| {
+            actor_package_with(ActorFixture::default(), program.clone(), resources)
+                .encode()
+                .unwrap()
+        };
+        let undeclared = package(None);
+        let declared = package(Some(exact));
+        let owner_raised = ActorResourceCeilings {
+            max_program_bytes: MAXIMUM as u32,
+            ..ActorResourceCeilings::standard()
+        };
+
+        // Re-admission of a retained package (replay, recovery) decides on
+        // the bytes alone, exactly as before this change.
+        admit_actor_package(&undeclared).unwrap();
+        let admitted = admit_actor_package(&declared).unwrap();
+        assert_eq!(admitted.manifest().resources, Some(exact));
+
+        // The standard ceilings admit neither: one must declare, the other is
+        // above the owner's default ceiling.
+        for bytes in [&undeclared, &declared] {
+            assert_eq!(
+                admit_actor_package_within(bytes, ActorResourceCeilings::standard()).err(),
+                Some(PackageAdmissionError::ResourceCeiling)
+            );
+        }
+        // The owner raises the ceiling: the declared actor installs; the
+        // undeclared one still must declare.
+        let installed = admit_actor_package_within(&declared, owner_raised).unwrap();
+        assert_eq!(installed.program(), ProgramId::of_pvm(&program));
+        assert_eq!(
+            admit_actor_package_within(&undeclared, owner_raised).err(),
+            Some(PackageAdmissionError::ResourceCeiling)
+        );
+        admit_actor_package_within(&declared, ActorResourceCeilings::runtime_maximum()).unwrap();
+
+        // Over any one of the owner's ceilings is refused.
+        for ceilings in [
+            ActorResourceCeilings {
+                max_program_bytes: exact.program_bytes - 1,
+                ..owner_raised
+            },
+            ActorResourceCeilings {
+                max_heap_bytes: exact.heap_bytes - ActorResources::PAGE_BYTES,
+                ..owner_raised
+            },
+            ActorResourceCeilings {
+                max_stack_bytes: exact.stack_bytes - 1,
+                ..owner_raised
+            },
+        ] {
+            assert_eq!(
+                admit_actor_package_within(&declared, ceilings).err(),
+                Some(PackageAdmissionError::ResourceCeiling)
+            );
+        }
+        // A ceiling above the runtime's hard maximum is not a valid ceiling.
+        let beyond = ActorResourceCeilings {
+            max_program_bytes: vos_agent_sdk::MAX_RUNTIME_PROGRAM_BYTES as u32 + 1,
+            ..owner_raised
+        };
+        assert!(!beyond.is_valid());
+        assert_eq!(
+            admit_actor_package_within(&declared, beyond).err(),
+            Some(PackageAdmissionError::ResourceCeiling)
+        );
+
+        // A declaration must restate the program exactly, on every path.
+        for wrong in [
+            ActorResources {
+                heap_bytes: exact.heap_bytes + ActorResources::PAGE_BYTES,
+                ..exact
+            },
+            ActorResources {
+                stack_bytes: exact.stack_bytes - ActorResources::PAGE_BYTES,
+                ..exact
+            },
+        ] {
+            let bytes = package(Some(wrong));
+            assert_eq!(
+                admit_actor_package(&bytes).err(),
+                Some(PackageAdmissionError::ResourceDeclarationMismatch)
+            );
+            assert_eq!(
+                admit_actor_package_within(&bytes, owner_raised).err(),
+                Some(PackageAdmissionError::ResourceDeclarationMismatch)
+            );
+        }
+
+        // A standard-size actor is unaffected, declared or not.
+        let small = standard_pvm(1);
+        let small_undeclared = actor_package_with(ActorFixture::default(), small, None)
+            .encode()
+            .unwrap();
+        admit_actor_package_within(&small_undeclared, ActorResourceCeilings::standard()).unwrap();
     }
 
     fn runtime_package(capabilities: RuntimeCapabilities, valid_program: bool) -> PackageEnvelope {

@@ -2359,6 +2359,7 @@ mod tests {
                     scheduling: false,
                     proof_systems: sdk::ProofSystemSet::EMPTY,
                 },
+                resources: None,
                 signing: package_signing(),
             }),
             artifacts,

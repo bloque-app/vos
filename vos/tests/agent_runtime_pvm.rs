@@ -566,6 +566,7 @@ fn admitted_actor_program_for(
                         .expect("one canonical proof-system requirement")
                 }),
             },
+            resources: None,
             signing: package_signing(),
         }),
         artifacts,

@@ -21,6 +21,14 @@ service-runtime = ["service"]
 # Typed service-actor client for node-local native extensions. Opt-in keeps
 # actors that do not use native I/O byte-identical to their existing PVMs.
 native-extension-client = ["pvm"]
+# Application-actor heap arena. The default is the compact 256-KiB profile;
+# an actor that needs more selects one of these, and the largest selected
+# wins. The arena is zero-initialised static data, so the choice lands in the
+# program's heap pages: it is part of the ProgramId, and a package declares it
+# (`ActorResources`) for the installing owner to admit.
+actor-heap-1m = ["pvm"]
+actor-heap-4m = ["pvm"]
+actor-heap-16m = ["pvm"]
 # The bundled agent runtime is an infrastructure guest like the former
 # service runtime, but it uses only the standard PVM inner-machine surface.
 # Keep its larger transient arena out of ordinary application actors.
