@@ -461,6 +461,52 @@ pub(crate) const MAX_CLEAN_MANAGEMENT_RESULT_BYTES: usize = 8 * 1024;
 const STANDARD_CLEAN_ACTOR_PACKAGES_MAGIC: [u8; 4] = *b"SCAP";
 const STANDARD_CLEAN_ACTOR_INSTALLATIONS_MAGIC: [u8; 4] = *b"SCI2";
 const STANDARD_CLEAN_INVOCATION_ERRORS_MAGIC: [u8; 4] = *b"SCER";
+const STANDARD_SEQUENCED_RETIREMENT_MAGIC: [u8; 4] = *b"SQRT";
+
+/// Optional trailing section of one result component: its sequenced
+/// retirement watermark. Absent while zero, so a component that never
+/// compacted encodes exactly as before this section existed.
+fn encode_sequenced_retirement(
+    encoder: &mut Encoder<'_>,
+    state: &StandardRuntimeState,
+    storage: super::InvocationResultStorage,
+) {
+    let retired_through = state.sequenced_retired_through.get(storage);
+    if retired_through == 0 {
+        return;
+    }
+    encoder
+        .0
+        .extend_from_slice(&STANDARD_SEQUENCED_RETIREMENT_MAGIC);
+    encoder.u16(1);
+    encoder.u64(retired_through);
+}
+
+/// The errors section and the watermark section are both optional, in that
+/// order. Returns both, leaving the decoder at the component's end.
+fn decode_result_component_tail(
+    decoder: &mut Decoder<'_>,
+    storage: super::InvocationResultStorage,
+) -> Result<(Vec<super::standard::StandardCleanInvocationError>, u64), DecodeError> {
+    let errors = if decoder.peek(STANDARD_SEQUENCED_RETIREMENT_MAGIC.len())
+        == Some(&STANDARD_SEQUENCED_RETIREMENT_MAGIC[..])
+    {
+        Vec::new()
+    } else {
+        decode_clean_invocation_errors(decoder, storage)?
+    };
+    if decoder.exhausted() {
+        return Ok((errors, 0));
+    }
+    if decoder.take(4)? != STANDARD_SEQUENCED_RETIREMENT_MAGIC || decoder.u16()? != 1 {
+        return Err(DecodeError::NonCanonical);
+    }
+    let retired_through = decoder.u64()?;
+    if retired_through == 0 {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok((errors, retired_through))
+}
 
 pub(crate) fn encode_clean_invocation_error(
     value: &super::standard::StandardCleanInvocationError,
@@ -775,6 +821,7 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
         });
     }
     encode_clean_invocation_errors(&mut encoder, state, super::InvocationResultStorage::Control);
+    encode_sequenced_retirement(&mut encoder, state, super::InvocationResultStorage::Control);
     RuntimeState {
         control,
         linear: encode_standard_lane(state, StateLane::Linear),
@@ -1243,11 +1290,15 @@ fn decode_standard_runtime_components(
             },
         )?)
     };
-    let mut clean_invocation_errors =
-        decode_clean_invocation_errors(&mut decoder, super::InvocationResultStorage::Control)?;
+    let (mut clean_invocation_errors, control_retired_through) =
+        decode_result_component_tail(&mut decoder, super::InvocationResultStorage::Control)?;
     if !decoder.exhausted() {
         return Err(DecodeError::TrailingBytes);
     }
+    let mut sequenced_retired_through = super::standard::StandardSequencedRetirement {
+        control: control_retired_through,
+        ..Default::default()
+    };
     let mut lane_revisions = super::standard::StandardLaneRevisions::default();
     let mut lane_state = StandardLaneState::default();
     for (lane, bytes) in [
@@ -1277,6 +1328,11 @@ fn decode_standard_runtime_components(
             StateLane::Linear => lane_state.linear = decoded.values,
             StateLane::Merge => lane_state.merge = decoded.values,
             StateLane::Local => lane_state.local = decoded.values,
+        }
+        match lane {
+            StateLane::Linear => sequenced_retired_through.linear = decoded.retired_through,
+            StateLane::Merge => sequenced_retired_through.merge = decoded.retired_through,
+            StateLane::Local => sequenced_retired_through.local = decoded.retired_through,
         }
         invocation_results.extend(decoded.invocation_results);
         clean_invocation_errors.extend(decoded.clean_invocation_errors);
@@ -1325,6 +1381,7 @@ fn decode_standard_runtime_components(
         invocation_results,
         clean_invocation_errors,
         clean_invocation_acknowledgements,
+        sequenced_retired_through,
         machine_continuations,
         lane_revisions,
         control_authority_slot,
@@ -1431,6 +1488,11 @@ fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8
         state,
         super::InvocationResultStorage::Lane(lane),
     );
+    encode_sequenced_retirement(
+        &mut encoder,
+        state,
+        super::InvocationResultStorage::Lane(lane),
+    );
     output
 }
 
@@ -1442,6 +1504,7 @@ struct DecodedStandardLane {
     clean_invocation_errors: Vec<super::standard::StandardCleanInvocationError>,
     clean_invocation_acknowledgements: Vec<crate::agent_sdk::InvocationAcknowledgement>,
     machine_continuations: Vec<StandardMachineContinuation>,
+    retired_through: u64,
 }
 
 pub(crate) const STANDARD_MACHINE_CONTINUATION_MAGIC: [u8; 4] = *b"SMCN";
@@ -2011,7 +2074,7 @@ fn decode_standard_lane(
     {
         return Err(DecodeError::NonCanonical);
     }
-    let clean_invocation_errors = decode_clean_invocation_errors(
+    let (clean_invocation_errors, retired_through) = decode_result_component_tail(
         &mut decoder,
         super::InvocationResultStorage::Lane(expected_lane),
     )?;
@@ -2026,6 +2089,7 @@ fn decode_standard_lane(
         clean_invocation_errors,
         clean_invocation_acknowledgements,
         machine_continuations,
+        retired_through,
     })
 }
 
@@ -15062,6 +15126,336 @@ pub(crate) mod tests {
             .clean_invocation_acknowledgements
             .push(retained[0].2);
         assert!(StandardAgentRuntime::restore(hostile).is_err());
+    }
+
+    /// One sequenced clean Linear invocation of the resolvable fixture:
+    /// accept, commit a `Done` result, and return its work and authorization.
+    #[cfg(feature = "pvm")]
+    fn commit_sequenced_linear(
+        runtime: &mut StandardAgentRuntime,
+        config: &AgentConfig,
+        template: &crate::agent_sdk::InvocationWork,
+        sequence: u64,
+    ) -> (
+        crate::agent_sdk::InvocationWork,
+        crate::agent_sdk::InvocationAuthorization,
+    ) {
+        use crate::agent_sdk::{
+            InvocationAuthorization, InvocationResultStorage, SequencedInvocation,
+        };
+        let mut work = template.clone();
+        work.invocation = SequencedInvocation::new(
+            InvocationResultStorage::Lane(crate::agent_sdk::StateLane::Linear),
+            core::num::NonZeroU64::new(sequence).unwrap(),
+        )
+        .invocation_id();
+        let authorization =
+            InvocationAuthorization::AuthorityReceipt(clean_authority_receipt(config, &work));
+        assert_eq!(
+            runtime.recover_clean_execution(&work, &authorization, 1),
+            Ok(None),
+            "sequence {sequence} is unseen"
+        );
+        runtime
+            .validate_clean_unseen_invocation_slot(&authorization, 1)
+            .unwrap();
+        let (invocation, ..) = runtime.resolve_clean_invocation(&work).unwrap();
+        let before = runtime.prepare_execution_state(&invocation).unwrap();
+        let mut after = before.clone();
+        after.linear = Some(sequence.to_le_bytes().to_vec());
+        let mut reply = exact_reply(&invocation, ActorExecutionStatus::Done);
+        runtime
+            .commit_clean_execution(
+                &work,
+                &authorization,
+                &invocation,
+                &mut reply,
+                &before,
+                after,
+                1,
+                None,
+            )
+            .unwrap();
+        (work, authorization)
+    }
+
+    #[cfg(feature = "pvm")]
+    fn reopen_checkpoint(runtime: &StandardAgentRuntime) -> StandardAgentRuntime {
+        let encoded = encode_standard_runtime_state(&runtime.snapshot());
+        let reopened =
+            StandardAgentRuntime::restore(decode_standard_runtime_state(&encoded).unwrap())
+                .unwrap();
+        assert_eq!(
+            encode_standard_runtime_state(&reopened.snapshot()),
+            encoded,
+            "checkpoint/reopen is byte-identical"
+        );
+        reopened
+    }
+
+    /// T-025-01: an Agent takes 10 000 acknowledged Linear invocations. Today
+    /// the 33rd acknowledgement and the 65th invocation are refused; with
+    /// sequenced identities the oldest contiguous retirement facts become a
+    /// watermark, which keeps every retired identity consumed.
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn sequenced_acknowledgements_compact_past_capacity_without_readmitting_work() {
+        use crate::agent_sdk::{InvocationAuthorization, InvocationError};
+
+        const INVOCATIONS: u64 = 10_000;
+        let (mut runtime, template) = clean_resolvable_fixture(false);
+        let config = runtime.config().unwrap().clone();
+        let capacity = super::super::standard::MAX_INVOCATION_ACKNOWLEDGEMENTS_PER_LANE;
+        let linear = crate::agent::InvocationResultStorage::Lane(crate::agent::StateLane::Linear);
+        let mut first = None;
+        let mut acknowledgements = Vec::new();
+        for sequence in 1..=INVOCATIONS {
+            let (work, authorization) =
+                commit_sequenced_linear(&mut runtime, &config, &template, sequence);
+            let acknowledgement = runtime
+                .acknowledge_clean_invocation(&work, &authorization)
+                .unwrap_or_else(|error| panic!("acknowledgement {sequence}: {error:?}"));
+            assert_eq!(
+                runtime.recover_clean_execution(&work, &authorization, 1),
+                Err(InvocationError::DivergentInvocation),
+                "retired work {sequence} never executes again"
+            );
+            let snapshot = runtime.snapshot();
+            assert!(snapshot.invocation_results.is_empty());
+            assert_eq!(
+                snapshot.clean_invocation_acknowledgements.len(),
+                (sequence as usize).min(capacity)
+            );
+            assert_eq!(
+                snapshot.sequenced_retired_through.get(linear),
+                sequence.saturating_sub(capacity as u64)
+            );
+            if sequence == 1 {
+                first = Some((work, authorization));
+            }
+            acknowledgements.push(acknowledgement);
+            if sequence % 1_000 == 0 {
+                runtime = reopen_checkpoint(&runtime);
+            }
+        }
+
+        // The oldest identity is compacted: Invoke and ACK retries are both
+        // refused as divergent, and neither the recovery nor the unseen path
+        // can execute it, even under a fresh receipt for the same work.
+        let (first_work, first_authorization) = first.unwrap();
+        let before = encode_standard_runtime_state(&runtime.snapshot());
+        assert_eq!(
+            runtime.recover_clean_execution(&first_work, &first_authorization, 1),
+            Err(InvocationError::DivergentInvocation)
+        );
+        assert_eq!(
+            runtime.acknowledge_clean_invocation(&first_work, &first_authorization),
+            Err(InvocationError::DivergentInvocation)
+        );
+        let mut resigned = clean_authority_receipt(&config, &first_work);
+        resigned.selector.expires_at = 5;
+        resigned.signature = authority_key().sign(&resigned.signing_bytes()).to_bytes();
+        let resigned = InvocationAuthorization::AuthorityReceipt(resigned);
+        assert_eq!(
+            runtime.recover_clean_execution(&first_work, &resigned, 1),
+            Err(InvocationError::DivergentInvocation),
+            "re-authorizing a retired identity cannot make it unseen"
+        );
+        assert_eq!(
+            runtime.retain_clean_unseen_expiry(&first_work, &resigned, 6),
+            Err(InvocationError::DivergentInvocation),
+            "nor can it mint an expiry fence claiming it never ran"
+        );
+        assert_eq!(encode_standard_runtime_state(&runtime.snapshot()), before);
+
+        // The most recent `capacity` retirements keep exact ACK retries.
+        let last = SequencedLinear::work(&template, &config, INVOCATIONS);
+        assert_eq!(
+            runtime
+                .acknowledge_clean_invocation(&last.0, &last.1)
+                .unwrap(),
+            *acknowledgements.last().unwrap()
+        );
+        assert_eq!(encode_standard_runtime_state(&runtime.snapshot()), before);
+
+        // An unsequenced fact is always kept exactly; the watermark never
+        // absorbs it. At capacity it takes the room of the next position.
+        let mut plain = template.clone();
+        plain.invocation = crate::agent_sdk::InvocationId([0x77; 32]);
+        let plain_authorization =
+            InvocationAuthorization::AuthorityReceipt(clean_authority_receipt(&config, &plain));
+        let (invocation, ..) = runtime.resolve_clean_invocation(&plain).unwrap();
+        let prior = runtime.prepare_execution_state(&invocation).unwrap();
+        let mut reply = exact_reply(&invocation, ActorExecutionStatus::Done);
+        runtime
+            .commit_clean_execution(
+                &plain,
+                &plain_authorization,
+                &invocation,
+                &mut reply,
+                &prior,
+                prior.clone(),
+                1,
+                None,
+            )
+            .unwrap();
+        let full = encode_standard_runtime_state(&runtime.snapshot());
+        // The oldest retained fact (sequence INVOCATIONS - capacity + 1) is the
+        // next position, so the plain fact may replace it.
+        runtime
+            .acknowledge_clean_invocation(&plain, &plain_authorization)
+            .unwrap();
+        assert_ne!(encode_standard_runtime_state(&runtime.snapshot()), full);
+        let reopened = reopen_checkpoint(&runtime);
+        assert_eq!(
+            reopened.snapshot().sequenced_retired_through.get(linear),
+            INVOCATIONS - capacity as u64 + 1
+        );
+
+        // A hostile image may not retain a fact at or below its watermark.
+        let mut hostile = reopened.snapshot();
+        hostile.sequenced_retired_through.linear = INVOCATIONS;
+        assert!(StandardAgentRuntime::restore(hostile).is_err());
+        let mut legacy = sparse_standard_state();
+        assert!(StandardAgentRuntime::restore(legacy.clone()).is_ok());
+        legacy.sequenced_retired_through.control = 1;
+        assert!(
+            StandardAgentRuntime::restore(legacy).is_err(),
+            "only a clean-generation image may carry a watermark"
+        );
+    }
+
+    /// Helper namespace so a test can rebuild the exact work of a sequence.
+    #[cfg(feature = "pvm")]
+    struct SequencedLinear;
+
+    #[cfg(feature = "pvm")]
+    impl SequencedLinear {
+        fn work(
+            template: &crate::agent_sdk::InvocationWork,
+            config: &AgentConfig,
+            sequence: u64,
+        ) -> (
+            crate::agent_sdk::InvocationWork,
+            crate::agent_sdk::InvocationAuthorization,
+        ) {
+            let mut work = template.clone();
+            work.invocation = crate::agent_sdk::SequencedInvocation::new(
+                crate::agent_sdk::InvocationResultStorage::Lane(
+                    crate::agent_sdk::StateLane::Linear,
+                ),
+                core::num::NonZeroU64::new(sequence).unwrap(),
+            )
+            .invocation_id();
+            let authorization = crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+                clean_authority_receipt(config, &work),
+            );
+            (work, authorization)
+        }
+    }
+
+    /// Compaction only takes the next position: a gap keeps the component
+    /// fail-closed until it is filled, and filling it may retire the new fact
+    /// itself straight into the watermark.
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn sequenced_compaction_waits_for_gaps_and_refuses_foreign_identities() {
+        use crate::agent_sdk::{
+            InvocationAuthorization, InvocationError, InvocationResultStorage,
+            SEQUENCED_INVOCATION_PREFIX, SequencedInvocation,
+        };
+
+        let (mut runtime, template) = clean_resolvable_fixture(false);
+        let config = runtime.config().unwrap().clone();
+        let capacity = super::super::standard::MAX_INVOCATION_ACKNOWLEDGEMENTS_PER_LANE as u64;
+        let linear = crate::agent::InvocationResultStorage::Lane(crate::agent::StateLane::Linear);
+        // Sequence 1 stays unacknowledged while 2..=capacity+1 fill the component.
+        let (first_work, first_authorization) =
+            commit_sequenced_linear(&mut runtime, &config, &template, 1);
+        for sequence in 2..=capacity + 1 {
+            let (work, authorization) =
+                commit_sequenced_linear(&mut runtime, &config, &template, sequence);
+            runtime
+                .acknowledge_clean_invocation(&work, &authorization)
+                .unwrap();
+        }
+        let (next_work, next_authorization) =
+            commit_sequenced_linear(&mut runtime, &config, &template, capacity + 2);
+        let full = encode_standard_runtime_state(&runtime.snapshot());
+        assert_eq!(
+            runtime.acknowledge_clean_invocation(&next_work, &next_authorization),
+            Err(InvocationError::ResultCapacity),
+            "a gap at the next position keeps today's refusal"
+        );
+        assert_eq!(encode_standard_runtime_state(&runtime.snapshot()), full);
+
+        // Filling the gap retires sequence 1 directly into the watermark.
+        runtime
+            .acknowledge_clean_invocation(&first_work, &first_authorization)
+            .unwrap();
+        assert_eq!(runtime.snapshot().sequenced_retired_through.get(linear), 1);
+        assert_eq!(
+            runtime.snapshot().clean_invocation_acknowledgements.len(),
+            capacity as usize
+        );
+        assert_eq!(
+            runtime.acknowledge_clean_invocation(&first_work, &first_authorization),
+            Err(InvocationError::DivergentInvocation)
+        );
+        runtime
+            .acknowledge_clean_invocation(&next_work, &next_authorization)
+            .unwrap();
+        assert_eq!(runtime.snapshot().sequenced_retired_through.get(linear), 2);
+        let mut runtime = reopen_checkpoint(&runtime);
+
+        // A Linear-component identity cannot be used from another component,
+        // and a malformed sequenced prefix is never admitted.
+        let mut foreign = template.clone();
+        foreign.mode = crate::agent_sdk::MethodMode::Query;
+        foreign.invocation = SequencedInvocation::new(
+            InvocationResultStorage::Lane(crate::agent_sdk::StateLane::Linear),
+            core::num::NonZeroU64::new(capacity + 10).unwrap(),
+        )
+        .invocation_id();
+        let foreign_authorization =
+            InvocationAuthorization::AuthorityReceipt(clean_authority_receipt(&config, &foreign));
+        assert_eq!(
+            runtime.recover_clean_execution(&foreign, &foreign_authorization, 1),
+            Err(InvocationError::DivergentInvocation)
+        );
+        let mut malformed = template.clone();
+        let mut bytes = [0u8; 32];
+        bytes[..16].copy_from_slice(&SEQUENCED_INVOCATION_PREFIX);
+        bytes[16] = 1;
+        malformed.invocation = crate::agent_sdk::InvocationId(bytes);
+        let malformed_authorization =
+            InvocationAuthorization::AuthorityReceipt(clean_authority_receipt(&config, &malformed));
+        assert_eq!(
+            runtime.recover_clean_execution(&malformed, &malformed_authorization, 1),
+            Err(InvocationError::DivergentInvocation)
+        );
+    }
+
+    #[test]
+    fn sequenced_retirement_section_is_absent_until_used_and_canonical() {
+        let state = sparse_standard_state();
+        let plain = encode_standard_runtime_state(&state);
+        assert!(
+            !plain
+                .control
+                .windows(4)
+                .any(|window| window == STANDARD_SEQUENCED_RETIREMENT_MAGIC)
+        );
+        let mut decoder_input = plain.clone();
+        decoder_input
+            .linear
+            .extend_from_slice(&STANDARD_SEQUENCED_RETIREMENT_MAGIC);
+        decoder_input.linear.extend_from_slice(&1u16.to_le_bytes());
+        decoder_input.linear.extend_from_slice(&0u64.to_le_bytes());
+        assert!(
+            decode_standard_runtime_components(&decoder_input).is_err(),
+            "a zero watermark is not canonical"
+        );
     }
 
     #[cfg(feature = "pvm")]
