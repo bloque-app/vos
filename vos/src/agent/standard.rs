@@ -41,9 +41,11 @@ pub const MAX_RETIRED_INSTALLATION_IDS: usize =
 /// item limit. Historical entries are retained until checkpoint compaction.
 pub const MAX_LANE_STATE_ENTRIES: usize = 16_384;
 
-type CleanInvocationParts = (
+/// The actor program is `P`: owned for callers that keep it, and borrowed
+/// from the work for execution, which never needs its own copy.
+type CleanInvocationParts<P = Vec<u8>> = (
     super::execution::ActorInvocation,
-    Vec<u8>,
+    P,
     crate::agent_sdk::RuntimeBlob,
     crate::agent_sdk::RuntimeBlob,
     Option<crate::agent_sdk::RuntimeBlob>,
@@ -55,11 +57,11 @@ type CleanInvocationParts = (
 pub(crate) struct ResolvedCleanInvocation<'work> {
     work: &'work crate::agent_sdk::InvocationWork,
     actor: ActorRecord,
-    parts: CleanInvocationParts,
+    parts: CleanInvocationParts<&'work [u8]>,
 }
 
-impl ResolvedCleanInvocation<'_> {
-    pub(crate) fn parts(&self) -> &CleanInvocationParts {
+impl<'work> ResolvedCleanInvocation<'work> {
+    pub(crate) fn parts(&self) -> &CleanInvocationParts<&'work [u8]> {
         &self.parts
     }
 }
@@ -2829,6 +2831,23 @@ impl StandardAgentRuntime {
         &self,
         work: &crate::agent_sdk::InvocationWork,
     ) -> Result<CleanInvocationParts, crate::agent_sdk::InvocationError> {
+        self.resolve_clean_invocation_borrowed(work).map(
+            |(invocation, program, schema, policies, installation_data)| {
+                (
+                    invocation,
+                    program.to_vec(),
+                    schema,
+                    policies,
+                    installation_data,
+                )
+            },
+        )
+    }
+
+    fn resolve_clean_invocation_borrowed<'work>(
+        &self,
+        work: &'work crate::agent_sdk::InvocationWork,
+    ) -> Result<CleanInvocationParts<&'work [u8]>, crate::agent_sdk::InvocationError> {
         use crate::agent_sdk::InvocationError;
 
         let actor_id = ActorId(work.actor.0);
@@ -2961,7 +2980,7 @@ impl StandardAgentRuntime {
             installation_data_index.map(|index| work.availability[index].clone());
         Ok((
             invocation,
-            work.availability[program_index].bytes.clone(),
+            work.availability[program_index].bytes.as_slice(),
             actor_schema,
             actor_policies,
             installation_data,
@@ -2972,7 +2991,7 @@ impl StandardAgentRuntime {
         &self,
         work: &'work crate::agent_sdk::InvocationWork,
     ) -> Result<ResolvedCleanInvocation<'work>, crate::agent_sdk::InvocationError> {
-        let parts = self.resolve_clean_invocation(work)?;
+        let parts = self.resolve_clean_invocation_borrowed(work)?;
         let actor = self
             .clean_invocation_target(work.actor, work.incarnation, work.deployment, work.program)?
             .record

@@ -71,73 +71,151 @@ fn zone_round(value: u64) -> Option<u64> {
 impl StandardProgram {
     /// Compute the initial flat-memory layout and register file.
     pub fn layout<'a>(&'a self, args: &'a [u8]) -> Option<StandardLayout<'a>> {
-        let ro_size = self.ro_data.len() as u64;
-        let rw_size = self.rw_data.len() as u64;
-        let stack_size = u64::from(self.stack_size);
-        let args_size = args.len() as u64;
-        if args_size > u64::from(INPUT_SIZE) {
-            return None;
-        }
-
-        let ro_zone = zone_round(ro_size)?;
-        let rw_total = rw_size.checked_add(u64::from(self.heap_pages) * u64::from(PAGE_SIZE))?;
-        let rw_zone = zone_round(rw_total)?;
-        let stack_zone = zone_round(stack_size)?;
-        let total = 5u64
-            .checked_mul(u64::from(ZONE_SIZE))?
-            .checked_add(ro_zone)?
-            .checked_add(rw_zone)?
-            .checked_add(stack_zone)?
-            .checked_add(u64::from(INPUT_SIZE))?;
-        if total > ADDRESS_SPACE {
-            return None;
-        }
-
-        let ro_base = u64::from(ZONE_SIZE);
-        let rw_base = 2 * u64::from(ZONE_SIZE) + ro_zone;
-        let stack_top = ADDRESS_SPACE - 2 * u64::from(ZONE_SIZE) - u64::from(INPUT_SIZE);
-        let stack_bottom = stack_top.checked_sub(page_round(stack_size)?)?;
-        let args_base = ADDRESS_SPACE - u64::from(ZONE_SIZE) - u64::from(INPUT_SIZE);
-        let heap_top = rw_base.checked_add(page_round(rw_total)?)?;
-
-        let mut registers = [0; REGISTER_COUNT];
-        registers[0] = HALT_ADDRESS;
-        registers[1] = stack_top;
-        registers[7] = args_base;
-        registers[8] = args_size;
-
-        Some(StandardLayout {
-            ro: Region {
-                base: ro_base,
-                size: page_round(ro_size)?,
-                writable: false,
-            },
-            rw: Region {
-                base: rw_base,
-                size: page_round(rw_total)?,
-                writable: true,
-            },
-            stack: Region {
-                base: stack_bottom,
-                size: page_round(stack_size)?,
-                writable: true,
-            },
-            args: Region {
-                base: args_base,
-                size: page_round(args_size)?,
-                writable: false,
-            },
-            ro_data: &self.ro_data,
-            rw_data: &self.rw_data,
-            args_data: args,
-            heap_top,
-            registers,
-        })
+        standard_layout(
+            &self.ro_data,
+            &self.rw_data,
+            self.heap_pages,
+            self.stack_size,
+            args,
+        )
     }
 
     /// Re-encode the program's executable portion for the `machine` host call.
     pub fn compact_code(&self) -> Option<Vec<u8>> {
         build_compact_code_blob(&self.code)
+    }
+}
+
+fn standard_layout<'a>(
+    ro_data: &'a [u8],
+    rw_data: &'a [u8],
+    heap_pages: u32,
+    stack_size: u32,
+    args: &'a [u8],
+) -> Option<StandardLayout<'a>> {
+    let ro_size = ro_data.len() as u64;
+    let rw_size = rw_data.len() as u64;
+    let stack_size = u64::from(stack_size);
+    let args_size = args.len() as u64;
+    if args_size > u64::from(INPUT_SIZE) {
+        return None;
+    }
+
+    let ro_zone = zone_round(ro_size)?;
+    let rw_total = rw_size.checked_add(u64::from(heap_pages) * u64::from(PAGE_SIZE))?;
+    let rw_zone = zone_round(rw_total)?;
+    let stack_zone = zone_round(stack_size)?;
+    let total = 5u64
+        .checked_mul(u64::from(ZONE_SIZE))?
+        .checked_add(ro_zone)?
+        .checked_add(rw_zone)?
+        .checked_add(stack_zone)?
+        .checked_add(u64::from(INPUT_SIZE))?;
+    if total > ADDRESS_SPACE {
+        return None;
+    }
+
+    let ro_base = u64::from(ZONE_SIZE);
+    let rw_base = 2 * u64::from(ZONE_SIZE) + ro_zone;
+    let stack_top = ADDRESS_SPACE - 2 * u64::from(ZONE_SIZE) - u64::from(INPUT_SIZE);
+    let stack_bottom = stack_top.checked_sub(page_round(stack_size)?)?;
+    let args_base = ADDRESS_SPACE - u64::from(ZONE_SIZE) - u64::from(INPUT_SIZE);
+    let heap_top = rw_base.checked_add(page_round(rw_total)?)?;
+
+    let mut registers = [0; REGISTER_COUNT];
+    registers[0] = HALT_ADDRESS;
+    registers[1] = stack_top;
+    registers[7] = args_base;
+    registers[8] = args_size;
+
+    Some(StandardLayout {
+        ro: Region {
+            base: ro_base,
+            size: page_round(ro_size)?,
+            writable: false,
+        },
+        rw: Region {
+            base: rw_base,
+            size: page_round(rw_total)?,
+            writable: true,
+        },
+        stack: Region {
+            base: stack_bottom,
+            size: page_round(stack_size)?,
+            writable: true,
+        },
+        args: Region {
+            base: args_base,
+            size: page_round(args_size)?,
+            writable: false,
+        },
+        ro_data,
+        rw_data,
+        args_data: args,
+        heap_top,
+        registers,
+    })
+}
+
+/// A standard program validated in place, borrowing every section from its
+/// canonical bytes.
+///
+/// [`Self::parse`] accepts exactly the blobs [`parse_standard_program`]
+/// accepts: both run [`validate_compact_code_blob`]. It copies nothing and
+/// never expands the instruction bitmask to one byte per code byte, and
+/// [`Self::code_blob`] is the program's own compact code blob, byte-for-byte
+/// what `parse_standard_program(blob)?.compact_code()` rebuilds. A guest that
+/// hands a program to the `machine` host call needs nothing else, so its
+/// work is independent of the program's size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StandardProgramRef<'a> {
+    pub ro_data: &'a [u8],
+    pub rw_data: &'a [u8],
+    pub heap_pages: u32,
+    pub stack_size: u32,
+    code_blob: &'a [u8],
+    code_len: usize,
+    packed_bitmask: &'a [u8],
+}
+
+impl<'a> StandardProgramRef<'a> {
+    pub fn parse(blob: &'a [u8]) -> Option<Self> {
+        let header = parse_standard_header(blob)?;
+        let code = validate_compact_code_blob(header.code_blob)?;
+        Some(Self {
+            ro_data: header.ro_data,
+            rw_data: header.rw_data,
+            heap_pages: header.heap_pages,
+            stack_size: header.stack_size,
+            code_blob: header.code_blob,
+            code_len: code.code_len,
+            packed_bitmask: &header.code_blob[code.packed_start..],
+        })
+    }
+
+    /// The canonical compact code blob for the `machine` host call.
+    pub const fn code_blob(&self) -> &'a [u8] {
+        self.code_blob
+    }
+
+    pub const fn code_len(&self) -> usize {
+        self.code_len
+    }
+
+    /// Whether `pc` starts an instruction, read from the packed bitmask.
+    pub fn is_instruction_start(&self, pc: usize) -> bool {
+        pc < self.code_len && (self.packed_bitmask[pc / 8] >> (pc % 8)) & 1 == 1
+    }
+
+    /// Compute the initial flat-memory layout and register file.
+    pub fn layout<'b>(&'b self, args: &'b [u8]) -> Option<StandardLayout<'b>> {
+        standard_layout(
+            self.ro_data,
+            self.rw_data,
+            self.heap_pages,
+            self.stack_size,
+            args,
+        )
     }
 }
 
@@ -220,7 +298,25 @@ fn copy_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(output)
 }
 
-pub fn parse_compact_code_blob(data: &[u8]) -> Option<CodeBlob> {
+/// Offsets of a validated compact code blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactCodeLayout {
+    pub jump_len: usize,
+    pub width: usize,
+    /// Offset of the first jump-table entry.
+    pub jump_start: usize,
+    /// Offset of the first code byte.
+    pub code_start: usize,
+    pub code_len: usize,
+    /// Offset of the packed bitmask, which runs to the end of the blob.
+    pub packed_start: usize,
+}
+
+/// Validate a compact code blob in place: canonical naturals, the minimal
+/// jump-entry width, exact length, and zero unused bitmask bits. This is the
+/// complete acceptance rule of [`parse_compact_code_blob`], which then only
+/// materializes. It reads each jump entry once and never the code bytes.
+pub fn validate_compact_code_blob(data: &[u8]) -> Option<CompactCodeLayout> {
     let (jump_len, jump_nat_len) = read_nat(data, 0)?;
     let mut offset = jump_nat_len;
     let width = usize::from(*data.get(offset)?);
@@ -237,6 +333,7 @@ pub fn parse_compact_code_blob(data: &[u8]) -> Option<CodeBlob> {
     // attacker-controlled count. In particular, a tiny blob declaring
     // u64::MAX jump entries must fail here rather than panic in the allocator.
     let jump_bytes = jump_len.checked_mul(width)?;
+    let jump_start = offset;
     let jump_end = offset.checked_add(jump_bytes)?;
     let code_end = jump_end.checked_add(code_len)?;
     let packed_len = code_len.div_ceil(8);
@@ -245,24 +342,50 @@ pub fn parse_compact_code_blob(data: &[u8]) -> Option<CodeBlob> {
         return None;
     }
 
-    let mut jump_table = Vec::new();
-    jump_table.try_reserve_exact(jump_len).ok()?;
+    let mut widest = 0u32;
     for _ in 0..jump_len {
-        jump_table.push(u32::try_from(read_le(data, offset, width)?).ok()?);
+        widest = widest.max(u32::try_from(read_le(data, offset, width)?).ok()?);
         offset = offset.checked_add(width)?;
     }
-    if usize::from(entry_size(&jump_table)) != width {
+    if usize::from(entry_size(&[widest])) != width {
         return None;
     }
-    let code = copy_bytes(data.get(offset..code_end)?)?;
-    offset = code_end;
-    let packed = data.get(offset..)?;
+    let packed = data.get(code_end..)?;
     if let Some(last) = packed.last()
         && code_len % 8 != 0
         && last & !((1u8 << (code_len % 8)) - 1) != 0
     {
         return None;
     }
+    Some(CompactCodeLayout {
+        jump_len,
+        width,
+        jump_start,
+        code_start: jump_end,
+        code_len,
+        packed_start: code_end,
+    })
+}
+
+pub fn parse_compact_code_blob(data: &[u8]) -> Option<CodeBlob> {
+    let layout = validate_compact_code_blob(data)?;
+    let CompactCodeLayout {
+        jump_len,
+        width,
+        jump_start,
+        code_start,
+        code_len,
+        packed_start,
+    } = layout;
+    let mut jump_table = Vec::new();
+    jump_table.try_reserve_exact(jump_len).ok()?;
+    let mut offset = jump_start;
+    for _ in 0..jump_len {
+        jump_table.push(u32::try_from(read_le(data, offset, width)?).ok()?);
+        offset = offset.checked_add(width)?;
+    }
+    let code = copy_bytes(data.get(code_start..packed_start)?)?;
+    let packed = data.get(packed_start..)?;
     let mut bitmask = Vec::new();
     bitmask.try_reserve_exact(code_len).ok()?;
     bitmask.resize(code_len, 0);
@@ -294,7 +417,15 @@ pub fn build_compact_code_blob(code: &CodeBlob) -> Option<Vec<u8>> {
     Some(output)
 }
 
-pub fn parse_standard_program(blob: &[u8]) -> Option<StandardProgram> {
+struct StandardHeader<'a> {
+    ro_data: &'a [u8],
+    rw_data: &'a [u8],
+    heap_pages: u32,
+    stack_size: u32,
+    code_blob: &'a [u8],
+}
+
+fn parse_standard_header(blob: &[u8]) -> Option<StandardHeader<'_>> {
     if blob.len() < 15 {
         return None;
     }
@@ -304,10 +435,10 @@ pub fn parse_standard_program(blob: &[u8]) -> Option<StandardProgram> {
     let stack_size = u32::try_from(read_le(blob, 8, 3)?).ok()?;
     let mut offset = 11usize;
     let ro_end = offset.checked_add(ro_size)?;
-    let ro_data = copy_bytes(blob.get(offset..ro_end)?)?;
+    let ro_data = blob.get(offset..ro_end)?;
     offset = ro_end;
     let rw_end = offset.checked_add(rw_size)?;
-    let rw_data = copy_bytes(blob.get(offset..rw_end)?)?;
+    let rw_data = blob.get(offset..rw_end)?;
     offset = rw_end;
     let code_len = usize::try_from(read_le(blob, offset, 4)?).ok()?;
     offset = offset.checked_add(4)?;
@@ -315,12 +446,23 @@ pub fn parse_standard_program(blob: &[u8]) -> Option<StandardProgram> {
     if code_end != blob.len() {
         return None;
     }
-    let code = parse_compact_code_blob(blob.get(offset..code_end)?)?;
-    Some(StandardProgram {
+    Some(StandardHeader {
         ro_data,
         rw_data,
         heap_pages,
         stack_size,
+        code_blob: blob.get(offset..code_end)?,
+    })
+}
+
+pub fn parse_standard_program(blob: &[u8]) -> Option<StandardProgram> {
+    let header = parse_standard_header(blob)?;
+    let code = parse_compact_code_blob(header.code_blob)?;
+    Some(StandardProgram {
+        ro_data: copy_bytes(header.ro_data)?,
+        rw_data: copy_bytes(header.rw_data)?,
+        heap_pages: header.heap_pages,
+        stack_size: header.stack_size,
         code,
     })
 }
@@ -438,7 +580,156 @@ mod tests {
         assert!(parse_compact_code_blob(&bytes).is_none());
     }
 
+    /// The borrowed view must agree with the owned parse on every input:
+    /// same acceptance, the same `machine` blob, the same layout and the same
+    /// instruction starts.
+    fn assert_views_agree(bytes: &[u8]) {
+        let owned = parse_standard_program(bytes);
+        let borrowed = StandardProgramRef::parse(bytes);
+        assert_eq!(owned.is_some(), borrowed.is_some(), "acceptance differs");
+        let (Some(owned), Some(borrowed)) = (owned, borrowed) else {
+            return;
+        };
+        assert_eq!(
+            Some(borrowed.code_blob().to_vec()),
+            owned.compact_code(),
+            "the embedded code blob is the re-encoded one"
+        );
+        assert_eq!(borrowed.ro_data, owned.ro_data.as_slice());
+        assert_eq!(borrowed.rw_data, owned.rw_data.as_slice());
+        assert_eq!(borrowed.heap_pages, owned.heap_pages);
+        assert_eq!(borrowed.stack_size, owned.stack_size);
+        assert_eq!(borrowed.code_len(), owned.code.code.len());
+        for pc in 0..owned.code.bitmask.len() + 9 {
+            assert_eq!(
+                borrowed.is_instruction_start(pc),
+                owned.code.bitmask.get(pc) == Some(&1),
+                "instruction start at {pc}"
+            );
+        }
+        for args in [&[][..], &[7, 8, 9][..]] {
+            let (a, b) = (owned.layout(args), borrowed.layout(args));
+            assert_eq!(a.is_some(), b.is_some());
+            if let (Some(a), Some(b)) = (a, b) {
+                assert_eq!(
+                    (a.ro, a.rw, a.stack, a.args, a.heap_top, a.registers),
+                    (b.ro, b.rw, b.stack, b.args, b.heap_top, b.registers)
+                );
+                assert_eq!((a.ro_data, a.rw_data), (b.ro_data, b.rw_data));
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_program_is_the_owned_program_without_copies() {
+        let bytes = build_standard_program(&sample()).unwrap();
+        assert_views_agree(&bytes);
+        let program = StandardProgramRef::parse(&bytes).unwrap();
+        // Zero-copy: every section points into the original bytes.
+        let range = bytes.as_ptr_range();
+        for section in [program.ro_data, program.rw_data, program.code_blob()] {
+            assert!(range.contains(&section.as_ptr()));
+        }
+        assert!(bytes.ends_with(program.code_blob()));
+    }
+
+    #[test]
+    fn borrowed_program_refuses_what_the_owned_parse_refuses() {
+        let valid = build_standard_program(&sample()).unwrap();
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        let mut prefixed = vec![3, 1, 2, 3];
+        prefixed.extend_from_slice(&valid);
+        let code = CodeBlob {
+            jump_table: Vec::new(),
+            code: vec![0],
+            bitmask: vec![1],
+        };
+        let mut unused_bits = build_standard_program(&StandardProgram {
+            code: code.clone(),
+            ..sample()
+        })
+        .unwrap();
+        *unused_bits.last_mut().unwrap() |= 0x80;
+        let code_blob_len = build_compact_code_blob(&code).unwrap().len();
+        let mut wide_entry = build_standard_program(&StandardProgram { code, ..sample() }).unwrap();
+        // Replace the code blob with one whose single jump entry (1) is
+        // encoded two bytes wide.
+        let blob = [1, 2, 1, 1, 0, 0, 1];
+        wide_entry.truncate(wide_entry.len() - code_blob_len - 4);
+        wide_entry.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        wide_entry.extend_from_slice(&blob);
+        for bytes in [
+            trailing,
+            prefixed,
+            unused_bits,
+            wide_entry,
+            Vec::new(),
+            vec![0; 15],
+        ] {
+            assert!(StandardProgramRef::parse(&bytes).is_none());
+            assert_views_agree(&bytes);
+        }
+    }
+
+    fn arbitrary_program() -> impl Strategy<Value = StandardProgram> {
+        (
+            proptest::collection::vec(any::<u8>(), 0..64),
+            proptest::collection::vec(any::<u8>(), 0..64),
+            0u32..4,
+            0u32..(1 << 16),
+            proptest::collection::vec(any::<u32>(), 0..6),
+            proptest::collection::vec(any::<bool>(), 0..40),
+        )
+            .prop_map(
+                |(ro_data, rw_data, heap_pages, stack_size, jump_table, starts)| StandardProgram {
+                    ro_data,
+                    rw_data,
+                    heap_pages,
+                    stack_size,
+                    code: CodeBlob {
+                        jump_table: jump_table
+                            .into_iter()
+                            .map(|entry| entry >> (entry % 32))
+                            .collect(),
+                        code: starts.iter().map(|start| u8::from(*start) * 3).collect(),
+                        bitmask: starts.iter().map(|start| u8::from(*start)).collect(),
+                    },
+                },
+            )
+    }
+
     proptest! {
+        #[test]
+        fn borrowed_and_owned_parses_agree_on_valid_programs(program in arbitrary_program()) {
+            let bytes = build_standard_program(&program).unwrap();
+            prop_assert_eq!(parse_standard_program(&bytes), Some(program));
+            assert_views_agree(&bytes);
+        }
+
+        #[test]
+        fn borrowed_and_owned_parses_agree_on_mutated_programs(
+            program in arbitrary_program(),
+            edits in proptest::collection::vec((any::<usize>(), any::<u8>()), 1..4),
+            cut in any::<usize>(),
+        ) {
+            let mut bytes = build_standard_program(&program).unwrap();
+            for (at, value) in edits {
+                let at = at % bytes.len();
+                bytes[at] = value;
+            }
+            assert_views_agree(&bytes);
+            bytes.truncate(cut % (bytes.len() + 1));
+            assert_views_agree(&bytes);
+        }
+
+        #[test]
+        fn borrowed_and_owned_parses_agree_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..96),
+        ) {
+            assert_views_agree(&bytes);
+        }
+
         #[test]
         fn naturals_round_trip(value: u64) {
             let mut bytes = Vec::new();

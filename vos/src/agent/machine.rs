@@ -11,7 +11,7 @@ pub use super::execution::{
     MAX_PORTABLE_MACHINE_MEMORY_BYTES, PortableMachineSnapshot, PortableMemoryRegion,
 };
 use crate::abi::pvm::inner;
-use vos_pvm_program::{PAGE_SIZE, Region, StandardProgram, parse_standard_program};
+use vos_pvm_program::{PAGE_SIZE, Region, StandardLayout, StandardProgram, StandardProgramRef};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoadError {
@@ -70,16 +70,19 @@ impl ActorMachine {
         initial_pc: u32,
         snapshot: Option<&PortableMachineSnapshot>,
     ) -> Result<Self, LoadError> {
-        let program = parse_standard_program(blob).ok_or(LoadError::InvalidProgram)?;
+        // Validate in place and hand the program's own compact code blob to
+        // `machine`. `StandardProgramRef` accepts exactly what
+        // `parse_standard_program` accepts, and its code blob is byte-for-byte
+        // what `compact_code` would rebuild, so the machine and the refusals
+        // are unchanged; the guest just no longer copies the sections or
+        // expands and re-packs the bitmask, work that grew with the program.
+        let program = StandardProgramRef::parse(blob).ok_or(LoadError::InvalidProgram)?;
         if snapshot.is_some()
-            && (usize::try_from(initial_pc)
-                .ok()
-                .and_then(|pc| program.code.bitmask.get(pc))
-                != Some(&1))
+            && !usize::try_from(initial_pc).is_ok_and(|pc| program.is_instruction_start(pc))
         {
             return Err(LoadError::InvalidSnapshot);
         }
-        let compact = program.compact_code().ok_or(LoadError::InvalidProgram)?;
+        let compact = program.code_blob();
         let layout = program.layout(args).ok_or(LoadError::InvalidLayout)?;
         let writable_regions: Vec<_> = [layout.rw, layout.stack]
             .into_iter()
@@ -91,7 +94,7 @@ impl ActorMachine {
         #[cfg(all(test, feature = "std", not(target_arch = "riscv64")))]
         let (raw_id, test_machines) = {
             let mut machines = vos_pvm::inner::InnerMachines::new();
-            let raw_id = match machines.create(&compact, initial_pc) {
+            let raw_id = match machines.create(compact, initial_pc) {
                 Ok(id) => u64::from(id),
                 Err(vos_pvm::inner::InnerError::Full) => inner::RESULT_FULL,
                 Err(_) => inner::RESULT_HUH,
@@ -99,7 +102,7 @@ impl ActorMachine {
             (raw_id, machines)
         };
         #[cfg(any(not(test), not(feature = "std"), target_arch = "riscv64"))]
-        let raw_id = inner::machine(&compact, initial_pc);
+        let raw_id = inner::machine(compact, initial_pc);
         if raw_id == inner::RESULT_FULL {
             return Err(LoadError::MachineLimit);
         }
@@ -114,7 +117,7 @@ impl ActorMachine {
         };
         machine.frame[1..].copy_from_slice(&layout.registers);
 
-        if let Err(error) = machine.initialize(&program, args) {
+        if let Err(error) = machine.initialize(&layout) {
             return Err(error);
         }
         if let Some(snapshot) = snapshot {
@@ -304,8 +307,7 @@ impl ActorMachine {
         Ok(snapshot)
     }
 
-    fn initialize(&mut self, program: &StandardProgram, args: &[u8]) -> Result<(), LoadError> {
-        let layout = program.layout(args).ok_or(LoadError::InvalidLayout)?;
+    fn initialize(&mut self, layout: &StandardLayout<'_>) -> Result<(), LoadError> {
         self.initialize_region(layout.ro, layout.ro_data)?;
         self.initialize_region(layout.rw, layout.rw_data)?;
         self.initialize_region(layout.stack, &[])?;
@@ -445,6 +447,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(returned, output);
+    }
+
+    /// The loader hands `machine` the program's own compact code blob, the
+    /// bytes a full parse would re-encode, and refuses exactly what the full
+    /// parse refuses, including a snapshot counter that is not an instruction.
+    #[cfg(all(feature = "std", not(target_arch = "riscv64")))]
+    #[test]
+    fn load_hands_machine_the_programs_own_code_blob() {
+        use vos_pvm_compiler::assembler::{Assembler, Reg};
+
+        let base = 2 * u64::from(vos_pvm_program::ZONE_SIZE);
+        let blob = Assembler::new()
+            .set_rw_data(b"own-code-blob".to_vec())
+            .load_imm_64(Reg::A0, base)
+            .load_imm_64(Reg::A1, 13)
+            .jump_ind(Reg::RA, 0)
+            .build_standard();
+        let rebuilt = vos_pvm_program::parse_standard_program(&blob)
+            .unwrap()
+            .compact_code()
+            .unwrap();
+        let machine = ActorMachine::load(&blob, b"args").unwrap();
+        let views: Vec<_> = machine
+            .test_machines
+            .borrow()
+            .views()
+            .map(|view| view.program.to_vec())
+            .collect();
+        assert_eq!(views, vec![rebuilt]);
+
+        let mut trailing = blob.clone();
+        trailing.push(0);
+        assert!(vos_pvm_program::parse_standard_program(&trailing).is_none());
+        assert_eq!(
+            ActorMachine::load(&trailing, b"args").err(),
+            Some(LoadError::InvalidProgram)
+        );
+
+        let mut machine = ActorMachine::load(&blob, b"args").unwrap();
+        assert_eq!(machine.resume(100_000), InnerExit::Halt);
+        let mut snapshot = machine.capture().unwrap();
+        let code_len = vos_pvm_program::parse_standard_program(&blob)
+            .unwrap()
+            .code
+            .code
+            .len();
+        let not_an_instruction = (0..code_len as u32 + 2)
+            .find(|pc| {
+                !vos_pvm_program::StandardProgramRef::parse(&blob)
+                    .unwrap()
+                    .is_instruction_start(*pc as usize)
+            })
+            .unwrap();
+        snapshot.pc = not_an_instruction;
+        assert_eq!(
+            ActorMachine::restore(&blob, b"args", &snapshot).err(),
+            Some(LoadError::InvalidSnapshot)
+        );
     }
 
     #[test]
@@ -665,7 +725,7 @@ mod tests {
             .load_imm_64(Reg::A1, yielded.len() as u64)
             .jump_ind(Reg::RA, 0);
         let blob = actor.build_standard();
-        parse_standard_program(&blob).unwrap()
+        vos_pvm_program::parse_standard_program(&blob).unwrap()
     }
 
     #[cfg(feature = "std")]
