@@ -12358,6 +12358,45 @@ mod tests {
             .try_init();
     }
 
+    /// Whether this replica's live Raft worker currently leads.
+    #[cfg(feature = "network")]
+    fn raft_leads(
+        host: &Arc<Mutex<SharedAgentHost>>,
+        attachment: &crate::network::SharedAgentNetworkHost,
+        network: &crate::network::Network,
+        agent: AgentId,
+    ) -> bool {
+        let Ok(Some(status)) = host.lock().map(|host| host.show(agent).ok().flatten()) else {
+            return false;
+        };
+        let Some((handler, true)) = attachment.attachment_for_test(agent) else {
+            return false;
+        };
+        let route = crate::network::agent_protocol::AgentGenerationRoute {
+            space: crate::agent_sdk::SpaceId(status.generation.space().0),
+            agent: crate::agent_sdk::AgentId(status.generation.agent().0),
+            generation: crate::agent_sdk::Hash(status.replication_id),
+        };
+        let Ok(request) = crate::network::agent_protocol::authenticate_sender(
+            &network.peer_id(),
+            crate::network::agent_protocol::AgentFrame {
+                route,
+                sender: network.agent_node_id(),
+                message: crate::network::agent_protocol::AgentMessage::Raft(
+                    crate::network::agent_protocol::RaftMessage::StatusRequest,
+                ),
+            },
+        ) else {
+            return false;
+        };
+        matches!(
+            handler.handle(request),
+            Ok(crate::network::agent_protocol::AgentMessage::Raft(
+                crate::network::agent_protocol::RaftMessage::StatusReply(Some(status))
+            )) if status.role == crate::network::agent_protocol::RaftRole::Leader
+        )
+    }
+
     /// One line per replica: host committee view, journal position, and the
     /// live Raft worker's role, term, commit and configuration.
     #[cfg(feature = "network")]
@@ -13436,6 +13475,68 @@ mod tests {
             "no mutation acknowledged in phase 1:\n{}",
             diagnose(&hosts, &networks)
         );
+        // KNOWN LIMITATION, kept deterministic here on purpose. A fresh joiner
+        // starts with an empty log, so it only admits its genesis voters:
+        // its route members are its own (genesis) committee view plus itself
+        // (`AttachmentFingerprint::route_members`, network/shared_agent.rs),
+        // and vos-raft accepts an authenticated append only from a sender in
+        // the follower's last-known configuration
+        // (support/vos-raft/src/worker.rs:1964). A joiner therefore catches up
+        // only while the leader is in every configuration it replays through.
+        // Lifting this needs two protocol decisions:
+        //  (A) the trust anchor telling an empty-log joiner which peers may
+        //      feed and lead it (e.g. the authority-signed admitting change,
+        //      or a certified checkpoint at the current configuration);
+        //  (B) vos-raft's catch-up rule for lagging followers at
+        //      worker.rs:1964 (e.g. also admit a host-supplied authenticated
+        //      target configuration, or catch up from a checkpoint).
+        // So the genesis voter must lead the replacement: steer leadership to
+        // it while all three voters are alive (outside any transition), then
+        // kill a non-genesis follower so no election is forced.
+        let leader_seed =
+            |seeds: &[u8],
+             hosts: &[Option<Arc<Mutex<SharedAgentHost>>>],
+             networks: &[Option<Arc<crate::network::Network>>]| {
+                let attachments = attachments.lock().unwrap();
+                seeds.iter().enumerate().find_map(|(index, seed)| {
+                    let (Some(host), Some(attachment), Some(network)) = (
+                        hosts[index].as_ref(),
+                        attachments[index].as_ref(),
+                        networks[index].as_ref(),
+                    ) else {
+                        return None;
+                    };
+                    raft_leads(host, attachment, network, agent).then_some(*seed)
+                })
+            };
+        let steer_deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            match leader_seed(&seeds, &hosts, &networks) {
+                Some(GENESIS) => break,
+                Some(other) => {
+                    // Silence the current leader's Raft transport until another
+                    // voter leads, then let it rejoin as a follower.
+                    let index = seeds.iter().position(|seed| *seed == other).unwrap();
+                    attachments.lock().unwrap()[index]
+                        .as_ref()
+                        .unwrap()
+                        .set_raft_isolated_for_test(agent, true)
+                        .unwrap();
+                    wait_until(std::time::Duration::from_secs(10), || {
+                        leader_seed(&seeds, &hosts, &networks).is_some_and(|leader| leader != other)
+                    });
+                    if let Some(attachment) = attachments.lock().unwrap()[index].as_ref() {
+                        let _ = attachment.set_raft_isolated_for_test(agent, false);
+                    }
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+            assert!(
+                std::time::Instant::now() < steer_deadline,
+                "the genesis voter did not become leader:\n{}",
+                diagnose(&hosts, &networks)
+            );
+        }
         kill(0x62, &seeds, &mut hosts, &mut networks);
         voters.retain(|seed| *seed != 0x62);
         phase.store(2, Ordering::Release);
@@ -13452,6 +13553,13 @@ mod tests {
             &mut directories,
             &mut hosts,
             &mut networks,
+        );
+        assert_eq!(
+            leader_seed(&seeds, &hosts, &networks),
+            Some(GENESIS),
+            "leadership left the genesis voter before the replacement (see the \
+             known limitation above):\n{}",
+            diagnose(&hosts, &networks)
         );
         let replaced = seeded_roster(&[
             (GENESIS, ReplicaRole::Voter),
