@@ -993,6 +993,37 @@ pub(crate) enum SharedJournalDriverError {
     CrossStoreMismatch,
     Snapshot(SharedCommitError),
     Executor(LocalReplayExecutorError),
+    CommitteeChange(CommitteeChangeRefusal),
+}
+
+/// Typed refusal of a Shared committee change, or of an ordinary proposal
+/// during one, before any Raft slot is allocated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitteeChangeRefusal {
+    /// A transition is prepared or joint. Ordinary commands and another
+    /// change must wait for its stable configuration.
+    TransitionPending,
+    /// The request does not replace the current descriptor replica generation.
+    StaleGeneration,
+    /// The active committee changed, but the descriptor has not yet adopted it
+    /// through its ordered `ChangeReplicas`.
+    DescriptorLag,
+    /// The descriptor may adopt a roster only after the committee runs it.
+    CommitteeChangeRequired,
+    /// A requested node is neither an active member nor supplied with a
+    /// canonical PeerId whose digest is that authority-signed node.
+    UnknownReplicaIdentity,
+    /// Clean ordered availability is defined for one or three voters.
+    UnsupportedVoterCount,
+    /// The leader's physical log is compacted. A voter that never received
+    /// it needs an authenticated checkpoint transfer first.
+    CheckpointTransferRequired,
+    /// The receipt or request does not admit this exact change, including
+    /// a receipt for another authority epoch than the ledger's.
+    InvalidAuthority,
+    /// Fixed-roster recovery custody is retained; it applies only on the
+    /// initial committee.
+    FixedRosterRecovery,
 }
 
 impl From<JournalStoreError> for SharedJournalDriverError {
@@ -1189,6 +1220,18 @@ pub(crate) enum PreparedCleanManagement {
         observed_slot: u64,
         commands: Vec<Vec<u8>>,
     },
+}
+
+/// One authority-verified, ledger-preflighted committee preparation. The
+/// leader must append `command` and, immediately after it in the same term,
+/// the joint configuration for `next_voters`: the ledger accepts only that
+/// adjacent Prepare -> Joint -> Stable sequence.
+#[derive(Debug)]
+pub(crate) struct PreparedCommitteeChange {
+    pub(crate) observed_slot: u64,
+    pub(crate) command: Vec<u8>,
+    pub(crate) next_voters: Vec<crate::agent_sdk::NodeId>,
+    pub(crate) next_committee: super::genesis::AgentReplicaCommitteeId,
 }
 
 /// Created only by the locked journal driver's fresh replay boundary. A caller
@@ -2003,6 +2046,20 @@ where
             self.ledger.active_committee()?.id(),
         )
         .map_err(|_| SharedJournalDriverError::WrongReplica)
+    }
+
+    /// Route for a new ordinary command. While a committee transition is
+    /// prepared or joint every replica refuses to apply anything but its
+    /// configuration legs, so no ordinary proposal may be prepared.
+    fn proposal_route(
+        &self,
+    ) -> Result<super::shared_raft::AgentRouteKey, SharedJournalDriverError> {
+        if self.ledger.pending_transition()?.is_some() {
+            return Err(SharedJournalDriverError::CommitteeChange(
+                CommitteeChangeRefusal::TransitionPending,
+            ));
+        }
+        self.active_route()
     }
 
     pub(crate) fn active_committee(
@@ -3114,10 +3171,19 @@ where
                 | crate::agent_sdk::ManagementRequest::InspectActors { .. }
                 | crate::agent_sdk::ManagementRequest::InspectResources
                 | crate::agent_sdk::ManagementRequest::InspectManagementHistory
-                | crate::agent_sdk::ManagementRequest::ChangeReplicas { .. }
                 | crate::agent_sdk::ManagementRequest::PrivateControl { .. }
         ) {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        // The descriptor may adopt only the roster the active committee
+        // already runs; `prepare_clean_committee_change` moves the committee.
+        if let crate::agent_sdk::ManagementRequest::ChangeReplicas { replicas, .. } = &request
+            && super::shared_raft::committee_sdk_replicas(&self.ledger.active_committee()?)
+                != *replicas
+        {
+            return Err(SharedJournalDriverError::CommitteeChange(
+                CommitteeChangeRefusal::CommitteeChangeRequired,
+            ));
         }
         let runtime = self.materialization.runtime().clone();
         let descriptor = self.executor.trusted_current_clean_descriptor(&runtime)?;
@@ -3237,7 +3303,7 @@ where
             });
         }
         let input_id = input.id();
-        let route = self.active_route()?;
+        let route = self.proposal_route()?;
         let mut commands = Vec::new();
         let artifact_batch = if catalog.is_empty() {
             None
@@ -3286,6 +3352,185 @@ where
             observed_slot,
             commands,
         })
+    }
+
+    /// Prepare the committee leg of a Shared `ChangeReplicas`. Returns `None`
+    /// when the request is not a replica change or when the active committee
+    /// already runs the requested roster; the ordinary ordered management
+    /// path then lets the runtime adopt it in the descriptor.
+    ///
+    /// Members already in the active committee keep their authenticated
+    /// identity. A node outside it must be supplied in `joining` as its
+    /// canonical Ed25519 PeerId: the authority-signed request names the node,
+    /// and a node is the digest of exactly one such PeerId, from which its key
+    /// and Raft slot are derived. Nothing here admits the node's store; that
+    /// node still has to open the generation before it can serve.
+    pub(crate) fn prepare_clean_committee_change(
+        &self,
+        request: &crate::agent_sdk::ManagementRequest,
+        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        joining: &[Vec<u8>],
+    ) -> Result<Option<PreparedCommitteeChange>, SharedJournalDriverError> {
+        use crate::agent_sdk::ManagementRequest;
+
+        let ManagementRequest::ChangeReplicas {
+            expected_generation,
+            replicas,
+        } = request
+        else {
+            return Ok(None);
+        };
+        let refuse = |reason| Err(SharedJournalDriverError::CommitteeChange(reason));
+        #[cfg(feature = "experimental-state-blocks")]
+        if self.external.is_some() {
+            return Err(SharedJournalDriverError::InvalidProfile);
+        }
+        let network = self.ledger.network_committee_state()?;
+        let active = network.active;
+        if super::shared_raft::committee_sdk_replicas(&active) == *replicas {
+            return Ok(None);
+        }
+        if network.next.is_some() {
+            return refuse(CommitteeChangeRefusal::TransitionPending);
+        }
+        if !request.is_valid() || joining.len() > super::MAX_AGENT_REPLICAS {
+            return refuse(CommitteeChangeRefusal::InvalidAuthority);
+        }
+        let descriptor = self
+            .executor
+            .trusted_current_clean_descriptor(self.materialization.runtime())?;
+        if descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared {
+            return Err(SharedJournalDriverError::InvalidProfile);
+        }
+        if descriptor.replicas != super::shared_raft::committee_sdk_replicas(&active) {
+            return refuse(CommitteeChangeRefusal::DescriptorLag);
+        }
+        if *expected_generation != descriptor.replica_generation() {
+            return refuse(CommitteeChangeRefusal::StaleGeneration);
+        }
+        let observed_slot = self.executor.current_logical_slot()?;
+        if super::driver::verify_clean_management_receipt(
+            &descriptor,
+            request,
+            authority,
+            observed_slot,
+            false,
+        )
+        .is_err()
+        {
+            return refuse(CommitteeChangeRefusal::InvalidAuthority);
+        }
+        let mut used = vec![false; joining.len()];
+        let mut members = Vec::with_capacity(replicas.len());
+        for requested in replicas {
+            let replica = super::AgentReplica {
+                node: NodeId(requested.node.0),
+                principal: crate::service::PrincipalId(requested.principal.0),
+                role: match requested.role {
+                    crate::agent_sdk::ReplicaRole::Voter => ReplicaRole::Voter,
+                    crate::agent_sdk::ReplicaRole::Observer => ReplicaRole::Observer,
+                },
+            };
+            let peer = match active.member_by_node(replica.node) {
+                Some(member) => member.peer_id().to_vec(),
+                None => {
+                    let Some(index) = joining
+                        .iter()
+                        .position(|peer| NodeId::of_authenticated_peer(peer) == replica.node)
+                    else {
+                        return refuse(CommitteeChangeRefusal::UnknownReplicaIdentity);
+                    };
+                    used[index] = true;
+                    joining[index].clone()
+                }
+            };
+            let Some(key) = peer
+                .len()
+                .checked_sub(32)
+                .and_then(|offset| <[u8; 32]>::try_from(&peer[offset..]).ok())
+            else {
+                return refuse(CommitteeChangeRefusal::UnknownReplicaIdentity);
+            };
+            let slot = (replica.role == ReplicaRole::Voter)
+                .then(|| super::genesis::derive_replica_raft_slot(&peer));
+            let Ok(member) = super::genesis::AgentReplicaMember::new(replica, peer, key, slot)
+            else {
+                return refuse(CommitteeChangeRefusal::UnknownReplicaIdentity);
+            };
+            members.push(member);
+        }
+        if used.iter().any(|used| !used) {
+            return refuse(CommitteeChangeRefusal::UnknownReplicaIdentity);
+        }
+        let Ok(next) = super::genesis::AgentReplicaCommittee::new(
+            active.space(),
+            active.agent(),
+            AgentProfile::Shared,
+            members,
+        ) else {
+            return refuse(CommitteeChangeRefusal::InvalidAuthority);
+        };
+        if !matches!(next.voter_count(), 1 | 3) {
+            return refuse(CommitteeChangeRefusal::UnsupportedVoterCount);
+        }
+        let joins_new_voter = next.members().iter().any(|member| {
+            member.replica().role == ReplicaRole::Voter
+                && active
+                    .member_by_node(member.replica().node)
+                    .is_none_or(|current| current.replica().role != ReplicaRole::Voter)
+        });
+        if joins_new_voter && self.current_snapshot()?.is_some() {
+            // A promoted or new voter must receive the complete physical
+            // suffix. Shared workers refuse generic InstallSnapshot, so a
+            // compacted leader cannot bring it up through Raft alone.
+            return refuse(CommitteeChangeRefusal::CheckpointTransferRequired);
+        }
+        let Ok(change) = super::shared_raft::PrepareCommitteeChange::new(
+            self.ledger.generation(),
+            active,
+            next,
+            *expected_generation,
+            observed_slot,
+            authority.clone(),
+        ) else {
+            return refuse(CommitteeChangeRefusal::InvalidAuthority);
+        };
+        self.ledger
+            .preflight_committee_change(&change)
+            .map_err(|error| match error {
+                AgentRaftApplicationErrorV2::OverlappingCommitteeChange => {
+                    SharedJournalDriverError::CommitteeChange(
+                        CommitteeChangeRefusal::TransitionPending,
+                    )
+                }
+                AgentRaftApplicationErrorV2::TransitionBarrier => {
+                    SharedJournalDriverError::CommitteeChange(
+                        CommitteeChangeRefusal::FixedRosterRecovery,
+                    )
+                }
+                AgentRaftApplicationErrorV2::WrongAuthority
+                | AgentRaftApplicationErrorV2::StaleAuthority
+                | AgentRaftApplicationErrorV2::AuthorityEpochExhausted
+                | AgentRaftApplicationErrorV2::StaleCommittee
+                | AgentRaftApplicationErrorV2::WrongGeneration => {
+                    SharedJournalDriverError::CommitteeChange(
+                        CommitteeChangeRefusal::InvalidAuthority,
+                    )
+                }
+                error => SharedJournalDriverError::Ledger(error),
+            })?;
+        let next_voters = change.next_voters().to_vec();
+        let next_committee = change.next().id();
+        let command = AgentRaftCommand::PrepareCommitteeChange(change);
+        command
+            .validate()
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        Ok(Some(PreparedCommitteeChange {
+            observed_slot,
+            command: command.encode(),
+            next_voters,
+            next_committee,
+        }))
     }
 
     pub(crate) fn inspect_clean_management(
@@ -4143,7 +4388,7 @@ where
         }
         let input = entry.input.id();
         let payload = AgentRaftCommand::Ordered {
-            route: self.active_route()?,
+            route: self.proposal_route()?,
             artifact_batch: None,
             entry,
         }
@@ -4471,7 +4716,7 @@ where
             },
         };
         let command = AgentRaftCommand::Ordered {
-            route: self.active_route()?,
+            route: self.proposal_route()?,
             artifact_batch: None,
             entry,
         };

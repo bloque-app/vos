@@ -133,6 +133,8 @@ pub enum SharedAgentHostError {
     SnapshotEvidenceLimit,
     PortableBackupUnsupported,
     PortableBackupInvalid,
+    /// A Shared replica change was refused before any Raft slot was used.
+    CommitteeChangeRefused,
 }
 
 pub(crate) enum SharedAuthorityProjectionAudit {
@@ -3302,6 +3304,41 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    /// Prepare the committee leg of a Shared `ChangeReplicas`; `None` means
+    /// the committee already runs the requested roster.
+    pub(crate) fn prepare_clean_committee_change(
+        &mut self,
+        agent: AgentId,
+        request: &crate::agent_sdk::ManagementRequest,
+        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        joining: &[Vec<u8>],
+    ) -> Result<Option<super::shared_journal_driver::PreparedCommitteeChange>, SharedAgentHostError>
+    {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .prepare_clean_committee_change(request, authority, joining)
+            .map_err(map_driver_error)
+    }
+
+    /// Fixed-roster recovery commands apply only on the initial committee
+    /// with no transition in flight; anything else would be refused by every
+    /// replica after commit.
+    pub(crate) fn fixed_roster_recovery_admissible(
+        &self,
+        agent: AgentId,
+    ) -> Result<bool, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .ledger()
+            .fixed_roster_recovery_admissible()
+            .map_err(map_ledger_error)
+    }
+
     pub(crate) fn inspect_clean_management(
         &self,
         agent: AgentId,
@@ -5948,6 +5985,12 @@ fn map_driver_error(error: SharedJournalDriverError) -> SharedAgentHostError {
             super::shared_commit::SharedCommitError::WrongSnapshotClaim,
         ) => SharedAgentHostError::SnapshotReplay,
         SharedJournalDriverError::Snapshot(_) => SharedAgentHostError::SnapshotCertificateInvalid,
+        SharedJournalDriverError::CommitteeChange(
+            super::shared_journal_driver::CommitteeChangeRefusal::TransitionPending,
+        ) => SharedAgentHostError::Unavailable,
+        SharedJournalDriverError::CommitteeChange(_) => {
+            SharedAgentHostError::CommitteeChangeRefused
+        }
         SharedJournalDriverError::InvalidArtifactBatch
         | SharedJournalDriverError::CrossStoreMismatch
         | SharedJournalDriverError::Executor(_)
@@ -8930,9 +8973,17 @@ mod tests {
             slots_before_denied_retry,
         );
 
+        // The descriptor may adopt only a roster the committee already runs.
+        // A different roster must first commit its committee transition, so
+        // the ordinary ordered path refuses it before allocating a slot.
+        let mut changed_roster = current_descriptor.replicas.clone();
+        changed_roster[0].role = match changed_roster[0].role {
+            crate::agent_sdk::ReplicaRole::Voter => crate::agent_sdk::ReplicaRole::Observer,
+            crate::agent_sdk::ReplicaRole::Observer => crate::agent_sdk::ReplicaRole::Voter,
+        };
         let change_replicas = crate::agent_sdk::ManagementRequest::ChangeReplicas {
             expected_generation: current_descriptor.replica_generation(),
-            replicas: current_descriptor.replicas.clone(),
+            replicas: changed_roster,
         };
         let change_receipt = clean_management_receipt(
             &current_descriptor,
@@ -8948,7 +8999,7 @@ mod tests {
                 SdkManagementArtifacts::None,
             )
             .unwrap_err(),
-            SharedAgentHostError::CorruptResidue,
+            SharedAgentHostError::CommitteeChangeRefused,
         );
         assert_eq!(
             host.show(fixture.shared.agent)
@@ -11683,7 +11734,7 @@ mod tests {
 
     #[cfg(feature = "network")]
     #[test]
-    fn observer_attaches_as_authenticated_merge_member_without_a_raft_worker() {
+    fn observer_attaches_as_authenticated_merge_member_with_a_passive_raft_worker() {
         let directory = TempDirectory::new("clean_network_observer");
         let fixture = fixture(0x2a);
         let observer = NodeId::of_authenticated_peer(&peer_id(&fixture.replica_keys[2]));
@@ -11706,7 +11757,9 @@ mod tests {
             crate::network::SharedAgentNetworkHost::attach(Arc::clone(&host), Arc::clone(&network))
                 .unwrap();
         let (handler, owns_worker) = attachment.attachment_for_test(fixture.agent).unwrap();
-        assert!(!owns_worker);
+        // The observer runs a passive worker so an authorized joint
+        // configuration can reach it; it is never a Raft member until then.
+        assert!(owns_worker);
         attachment.assert_merge_noop_gate_for_test(fixture.agent);
         assert_eq!(
             host.lock().unwrap().require_transport(fixture.agent),
@@ -11741,7 +11794,15 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(handler.handle(raft).is_err());
+        let local = network.agent_node_id();
+        assert!(matches!(
+            handler.handle(raft),
+            Ok(crate::network::agent_protocol::AgentMessage::Raft(
+                crate::network::agent_protocol::RaftMessage::StatusReply(Some(status))
+            )) if status.role == crate::network::agent_protocol::RaftRole::Follower
+                && !status.members.contains(&local)
+                && status.joint_old.is_none()
+        ));
 
         drop(attachment);
         drop(handler);
@@ -11985,5 +12046,985 @@ mod tests {
         drop(host_b);
         join_live_network(network_a);
         join_live_network(network_b);
+    }
+
+    #[cfg(feature = "pvm")]
+    fn open_native_clean_host_for_seed(
+        directory: &TempDirectory,
+        fixture: &Fixture,
+        seed: u8,
+        slot: Arc<AtomicU64>,
+    ) -> SharedAgentHost {
+        let signing = key(seed);
+        let node = NodeId::of_authenticated_peer(&peer_id(&signing));
+        SharedAgentHost::open(
+            directory.root(),
+            directory.lock(),
+            AgentHostScope {
+                space: fixture.space,
+                node,
+            },
+            Arc::new(NativeCleanTrust {
+                authority: fixture.authority.clone(),
+                slot,
+            }),
+            Arc::new(SigningMerge(signing)),
+            Arc::new(AcceptFinality),
+        )
+        .unwrap()
+    }
+
+    /// Production derives the committee-change trust root from the Shared
+    /// descriptor's authority binding; one receipt then admits both the
+    /// committee leg and the runtime's ordered `ChangeReplicas`.
+    #[cfg(feature = "pvm")]
+    fn descriptor_committee_authority(
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+    ) -> CommitteeChangeAuthorityBinding {
+        CommitteeChangeAuthorityBinding::new(
+            descriptor.authority.policy,
+            descriptor.authority.issuer,
+            descriptor.identity.runtime_deployment,
+            descriptor.authority.public_key,
+            descriptor.authority.initial_epoch,
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "pvm")]
+    fn epoch_management_receipt(
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        request: &crate::agent_sdk::ManagementRequest,
+        sequence: u64,
+        epoch: u64,
+        authority_key: &SigningKey,
+    ) -> crate::agent_sdk::authority::AuthorityReceipt {
+        let mut receipt = clean_management_receipt(descriptor, request, sequence, authority_key);
+        receipt.selector.epoch = epoch;
+        receipt.signature = authority_key.sign(&receipt.signing_bytes()).to_bytes();
+        receipt.validate_shape().unwrap();
+        receipt
+    }
+
+    /// Canonical SDK roster for the given replica seeds, in node order.
+    #[cfg(feature = "pvm")]
+    fn seeded_roster(replicas: &[(u8, ReplicaRole)]) -> Vec<crate::agent_sdk::AgentReplica> {
+        let mut roster = replicas
+            .iter()
+            .map(|(seed, role)| {
+                let replica = replica_member(&key(*seed), *role).replica();
+                crate::agent_sdk::AgentReplica {
+                    node: crate::agent_sdk::NodeId(replica.node.0),
+                    principal: crate::agent_sdk::PrincipalId(replica.principal.0),
+                    role: match replica.role {
+                        ReplicaRole::Voter => crate::agent_sdk::ReplicaRole::Voter,
+                        ReplicaRole::Observer => crate::agent_sdk::ReplicaRole::Observer,
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        roster.sort_by_key(|replica| replica.node);
+        roster
+    }
+
+    /// Fully connected loopback libp2p mesh keyed by the replica seeds.
+    #[cfg(feature = "network")]
+    fn live_mesh(seeds: &[u8]) -> Vec<Arc<crate::network::Network>> {
+        let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+        let networks = seeds
+            .iter()
+            .map(|seed| live_network(*seed, vec![listen.clone()]))
+            .collect::<Vec<_>>();
+        for network in &networks {
+            assert!(wait_until(std::time::Duration::from_secs(5), || {
+                !network.listen_addrs().is_empty()
+            }));
+        }
+        for (index, network) in networks.iter().enumerate() {
+            for earlier in &networks[..index] {
+                network.connect(
+                    earlier.listen_addrs()[0]
+                        .clone()
+                        .with(libp2p::multiaddr::Protocol::P2p(earlier.peer_id())),
+                );
+            }
+        }
+        networks
+    }
+
+    /// Exact replicated state of one replica: its ordered journal position,
+    /// the runtime's management-history commitment, and its actor directory.
+    #[cfg(feature = "network")]
+    fn replicated_state(
+        host: &Arc<Mutex<SharedAgentHost>>,
+        agent: AgentId,
+    ) -> Option<(
+        SharedAgentJournalPosition,
+        crate::agent_sdk::Hash,
+        crate::agent_sdk::ActorDirectoryPage,
+    )> {
+        let host = host.lock().ok()?;
+        let position = host.journal_position(agent).ok()?;
+        let crate::agent_sdk::RuntimeOutcome::Management(Ok(
+            crate::agent_sdk::ManagementReply::ManagementHistory(history),
+        )) = host
+            .inspect_clean_management(
+                agent,
+                &crate::agent_sdk::ManagementRequest::InspectManagementHistory,
+            )
+            .ok()?
+        else {
+            return None;
+        };
+        let crate::agent_sdk::RuntimeOutcome::Management(Ok(
+            crate::agent_sdk::ManagementReply::Actors(actors),
+        )) = host
+            .inspect_clean_management(
+                agent,
+                &crate::agent_sdk::ManagementRequest::InspectActors {
+                    after: None,
+                    limit: crate::agent_sdk::MAX_DIRECTORY_PAGE_ENTRIES as u16,
+                },
+            )
+            .ok()?
+        else {
+            return None;
+        };
+        Some((position, history, actors))
+    }
+
+    /// Every listed replica runs `roster` as a stable committee and in its
+    /// descriptor, and all of them hold the identical replicated state.
+    #[cfg(feature = "network")]
+    fn committee_converged(
+        hosts: &[&Arc<Mutex<SharedAgentHost>>],
+        agent: AgentId,
+        roster: &[crate::agent_sdk::AgentReplica],
+    ) -> bool {
+        let mut first = None;
+        for host in hosts {
+            let Ok(locked) = host.lock() else {
+                return false;
+            };
+            let Ok(Some(status)) = locked.show(agent) else {
+                return false;
+            };
+            let runs_roster = status.committee_transition.is_none()
+                && status.replicas.len() == roster.len()
+                && status.replicas.iter().zip(roster).all(|(route, replica)| {
+                    route.node.0 == replica.node.0
+                        && (route.role == ReplicaRole::Voter)
+                            == (replica.role == crate::agent_sdk::ReplicaRole::Voter)
+                })
+                && locked
+                    .clean_runtime_descriptor(agent)
+                    .is_ok_and(|descriptor| descriptor.replicas == roster);
+            drop(locked);
+            if !runs_roster {
+                return false;
+            }
+            let Some(state) = replicated_state(host, agent) else {
+                return false;
+            };
+            match &first {
+                None => first = Some(state),
+                Some(first) if *first == state => {}
+                Some(_) => return false,
+            }
+        }
+        true
+    }
+
+    #[cfg(feature = "pvm")]
+    fn committee_change_fixture(nonce: u8, replicas: &[(u8, ReplicaRole)]) -> Fixture {
+        let runtime = super::super::package_admission::admitted_scripted_runtime_for_test(
+            "shared-committee-change",
+            0x74,
+            vec![super::super::package_admission::ScriptedRuntimeCase {
+                input: vec![0],
+                output: vec![0],
+                copies: Vec::new(),
+            }],
+        );
+        standard_projection_fixture_with_replicas(nonce, runtime, replicas, false)
+    }
+
+    /// Single-host, deterministic walk of a complete replica change with a
+    /// real SDK receipt: the committee leg admits nodes outside the initial
+    /// committee only through their authenticated PeerIds, the ledger
+    /// applies Prepare -> Joint -> Stable, ordinary commands wait for it, and
+    /// the runtime then adopts the roster in the descriptor.
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn signed_change_replicas_binds_new_nodes_and_applies_every_leg() {
+        use crate::service::wire::ServiceWire as _;
+
+        let fixture = committee_change_fixture(0x5c, &[(0x31, ReplicaRole::Voter)]);
+        let agent = fixture.agent;
+        let directory = TempDirectory::new("committee_change_new_nodes");
+        let slot = Arc::new(AtomicU64::new(20));
+        let mut host =
+            open_native_clean_host_for_seed(&directory, &fixture, 0x31, Arc::clone(&slot));
+        host.provision(
+            fixture.provision.clone(),
+            fixture.catalog.clone(),
+            descriptor_committee_authority(&fixture.descriptor),
+        )
+        .unwrap();
+        let roster = seeded_roster(&[
+            (0x31, ReplicaRole::Voter),
+            (0x3a, ReplicaRole::Voter),
+            (0x3b, ReplicaRole::Voter),
+        ]);
+        let change = crate::agent_sdk::ManagementRequest::ChangeReplicas {
+            expected_generation: fixture.descriptor.replica_generation(),
+            replicas: roster.clone(),
+        };
+        let receipt =
+            clean_management_receipt(&fixture.descriptor, &change, 2, &fixture.authority_key);
+        let new_a = peer_id(&key(0x3a));
+        let new_b = peer_id(&key(0x3b));
+        let stranger = peer_id(&key(0x3c));
+        let applied_before = host.show(agent).unwrap().unwrap().applied_slots;
+
+        // A new node is admitted only by the PeerId whose digest is the
+        // authority-signed node; missing, partial or extra identities fail.
+        for joining in [
+            Vec::new(),
+            vec![new_a.clone()],
+            vec![new_a.clone(), stranger.clone()],
+            vec![new_a.clone(), new_b.clone(), stranger],
+        ] {
+            assert_eq!(
+                host.prepare_clean_committee_change(agent, &change, &receipt, &joining)
+                    .unwrap_err(),
+                SharedAgentHostError::CommitteeChangeRefused,
+            );
+        }
+        let stale = crate::agent_sdk::ManagementRequest::ChangeReplicas {
+            expected_generation: crate::agent_sdk::Hash([0x77; 32]),
+            replicas: roster.clone(),
+        };
+        let stale_receipt =
+            clean_management_receipt(&fixture.descriptor, &stale, 2, &fixture.authority_key);
+        let joining = vec![new_b.clone(), new_a.clone()];
+        assert_eq!(
+            host.prepare_clean_committee_change(agent, &stale, &stale_receipt, &joining)
+                .unwrap_err(),
+            SharedAgentHostError::CommitteeChangeRefused,
+        );
+        // The ledger's authority epoch is part of the binding.
+        let other_epoch =
+            epoch_management_receipt(&fixture.descriptor, &change, 2, 2, &fixture.authority_key);
+        assert_eq!(
+            host.prepare_clean_committee_change(agent, &change, &other_epoch, &joining)
+                .unwrap_err(),
+            SharedAgentHostError::CommitteeChangeRefused,
+        );
+        // The descriptor cannot adopt a roster the committee does not run.
+        assert_eq!(
+            host.prepare_clean_management(
+                agent,
+                change.clone(),
+                receipt.clone(),
+                SdkManagementArtifacts::None,
+            )
+            .unwrap_err(),
+            SharedAgentHostError::CommitteeChangeRefused,
+        );
+        assert_eq!(
+            host.show(agent).unwrap().unwrap().applied_slots,
+            applied_before
+        );
+
+        let prepared = host
+            .prepare_clean_committee_change(agent, &change, &receipt, &joining)
+            .unwrap()
+            .unwrap();
+        let super::super::shared_raft::AgentRaftCommand::PrepareCommitteeChange(prepare) =
+            super::super::shared_raft::AgentRaftCommand::decode(&prepared.command).unwrap()
+        else {
+            panic!("committee leg is not a PrepareCommitteeChange")
+        };
+        assert_eq!(prepare.authority(), &receipt);
+        assert_eq!(prepare.authority().selector.request, change.commitment());
+        assert_eq!(prepare.observed_slot(), 20);
+        assert_eq!(
+            super::super::shared_raft::committee_sdk_replicas(prepare.next()),
+            roster
+        );
+        for peer in [&new_a, &new_b] {
+            assert!(prepare.next().member_by_peer_id(peer).is_some());
+        }
+        assert_eq!(prepared.next_voters, prepare.next_voters());
+        assert_eq!(prepared.next_committee, prepare.next().id());
+
+        let append = |host: &SharedAgentHost, kind: EntryKind<crate::agent_sdk::NodeId>| {
+            host.agents[&agent]
+                .driver
+                .ledger()
+                .append_committed_for_test(7, &kind)
+                .unwrap()
+        };
+        let index = append(
+            &host,
+            EntryKind::Data {
+                payload: prepared.command.clone(),
+            },
+        );
+        assert_eq!(
+            host.apply_next(agent).unwrap(),
+            SharedAgentApplyOutcome::Applied { index }
+        );
+        let transition = host
+            .show(agent)
+            .unwrap()
+            .unwrap()
+            .committee_transition
+            .unwrap();
+        assert!(!transition.joint);
+        assert_eq!(transition.next_committee, prepare.next().id());
+        assert!(
+            transition
+                .next_replicas
+                .iter()
+                .any(|replica| replica.peer_id == new_a)
+        );
+
+        // While the change is pending, nothing else may take a slot.
+        let actor_package = super::super::package_admission::admitted_standard_query_actor_for_test(
+            "committee-barrier-worker",
+            crate::agent_sdk::StateLane::Linear,
+            0x78,
+        );
+        let install = clean_install_request(fixture.descriptor.identity.agent, &actor_package);
+        let install_receipt =
+            clean_management_receipt(&fixture.descriptor, &install, 3, &fixture.authority_key);
+        assert_eq!(
+            host.prepare_clean_management(
+                agent,
+                install,
+                install_receipt,
+                SdkManagementArtifacts::Actor(&actor_package),
+            )
+            .unwrap_err(),
+            SharedAgentHostError::Unavailable,
+        );
+        assert_eq!(
+            host.prepare_clean_committee_change(agent, &change, &receipt, &joining)
+                .unwrap_err(),
+            SharedAgentHostError::Unavailable,
+        );
+
+        let joint = append(
+            &host,
+            EntryKind::ConfigChange {
+                joint_old: Some(prepare.previous_voters().to_vec()),
+                members: prepare.next_voters().to_vec(),
+            },
+        );
+        assert_eq!(joint, index + 1);
+        assert_eq!(
+            host.apply_next(agent).unwrap(),
+            SharedAgentApplyOutcome::Applied { index: joint }
+        );
+        assert!(
+            host.show(agent)
+                .unwrap()
+                .unwrap()
+                .committee_transition
+                .unwrap()
+                .joint
+        );
+        let stable = append(
+            &host,
+            EntryKind::ConfigChange {
+                joint_old: None,
+                members: prepare.next_voters().to_vec(),
+            },
+        );
+        assert_eq!(
+            host.apply_next(agent).unwrap(),
+            SharedAgentApplyOutcome::Applied { index: stable }
+        );
+        let status = host.show(agent).unwrap().unwrap();
+        assert_eq!(status.committee_transition, None);
+        assert_eq!(status.route.committee(), prepare.next().id());
+        assert_eq!(
+            status
+                .replicas
+                .iter()
+                .map(|replica| (replica.node.0, replica.role))
+                .collect::<Vec<_>>(),
+            roster
+                .iter()
+                .map(|replica| (replica.node.0, ReplicaRole::Voter))
+                .collect::<Vec<_>>()
+        );
+
+        // The committee runs the roster; the descriptor leg is ordinary.
+        assert!(
+            host.prepare_clean_committee_change(agent, &change, &receipt, &[])
+                .unwrap()
+                .is_none()
+        );
+        let descriptor_leg = host
+            .prepare_clean_management(
+                agent,
+                change.clone(),
+                receipt.clone(),
+                SdkManagementArtifacts::None,
+            )
+            .unwrap();
+        let input = descriptor_leg.input().expect("fresh descriptor leg");
+        for payload in descriptor_leg.into_commands() {
+            let index = append(&host, EntryKind::Data { payload });
+            assert_eq!(
+                host.apply_next(agent).unwrap(),
+                SharedAgentApplyOutcome::Applied { index }
+            );
+        }
+        let generation = crate::agent_sdk::replica_set_generation(
+            &fixture.descriptor.identity,
+            fixture.descriptor.creation_nonce,
+            &roster,
+        );
+        assert!(matches!(
+            host.take_clean_ordered_result(agent, input).unwrap(),
+            crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                crate::agent_sdk::ManagementReply::ReplicasChanged { generation: applied }
+            )) if applied == generation
+        ));
+        assert_eq!(
+            host.clean_runtime_descriptor(agent).unwrap().replicas,
+            roster
+        );
+        assert!(
+            host.prepare_clean_management(
+                agent,
+                change.clone(),
+                receipt.clone(),
+                SdkManagementArtifacts::None,
+            )
+            .unwrap()
+            .retained()
+            .is_some(),
+            "an exact replay is retained, never applied twice"
+        );
+
+        drop(host);
+        let reopened = open_native_clean_host_for_seed(&directory, &fixture, 0x31, slot);
+        let status = reopened.show(agent).unwrap().unwrap();
+        assert_eq!(status.route.committee(), prepare.next().id());
+        assert_eq!(status.committee_transition, None);
+        assert_eq!(
+            reopened.clean_runtime_descriptor(agent).unwrap().replicas,
+            roster
+        );
+    }
+
+    /// One voter grows online to three by promoting two observers through a
+    /// signed SDK `ChangeReplicas`, then commits with a two-of-three quorum.
+    #[cfg(all(feature = "network", feature = "pvm"))]
+    #[test]
+    fn signed_change_replicas_grows_one_voter_to_three_and_commits_with_two() {
+        use crate::network::shared_agent::CleanManagementSubmission;
+
+        let seeds = [0x31_u8, 0x32, 0x33];
+        let fixture = committee_change_fixture(
+            0x5a,
+            &[
+                (0x31, ReplicaRole::Voter),
+                (0x32, ReplicaRole::Observer),
+                (0x33, ReplicaRole::Observer),
+            ],
+        );
+        let agent = fixture.agent;
+        let authority = descriptor_committee_authority(&fixture.descriptor);
+        let slot = Arc::new(AtomicU64::new(20));
+        let directories = seeds
+            .iter()
+            .map(|seed| TempDirectory::new(&format!("committee_grow_{seed:02x}")))
+            .collect::<Vec<_>>();
+        let mut hosts = seeds
+            .iter()
+            .zip(&directories)
+            .map(|(seed, directory)| {
+                let mut host =
+                    open_native_clean_host_for_seed(directory, &fixture, *seed, Arc::clone(&slot));
+                host.provision(
+                    fixture.provision.clone(),
+                    fixture.catalog.clone(),
+                    authority,
+                )
+                .unwrap();
+                Arc::new(Mutex::new(host))
+            })
+            .collect::<Vec<_>>();
+        let mut networks = live_mesh(&seeds);
+        let mut attachments = hosts
+            .iter()
+            .zip(&networks)
+            .map(|(host, network)| {
+                Some(
+                    crate::network::SharedAgentNetworkHost::attach(
+                        Arc::clone(host),
+                        Arc::clone(network),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for attachment in attachments.iter().flatten() {
+            assert!(attachment.attachment_for_test(agent).unwrap().1);
+        }
+
+        // An ordered mutation commits on the single voter alone.
+        let actor_package = super::super::package_admission::admitted_standard_query_actor_for_test(
+            "committee-grow-worker",
+            crate::agent_sdk::StateLane::Linear,
+            0x76,
+        );
+        let install = clean_install_request(fixture.descriptor.identity.agent, &actor_package);
+        let install_receipt =
+            clean_management_receipt(&fixture.descriptor, &install, 2, &fixture.authority_key);
+        let CleanManagementSubmission::Applied {
+            outcome:
+                crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                    crate::agent_sdk::ManagementReply::Installed(entry),
+                )),
+            ..
+        } = manage_live(
+            &mut attachments,
+            agent,
+            &install,
+            &install_receipt,
+            SdkManagementArtifacts::Actor(&actor_package),
+        )
+        else {
+            panic!("single-voter Install did not apply")
+        };
+
+        // Grow to three voters with one exact Authority receipt over the SDK
+        // request. The committee leg runs first, then the descriptor leg.
+        let grown = seeded_roster(&[
+            (0x31, ReplicaRole::Voter),
+            (0x32, ReplicaRole::Voter),
+            (0x33, ReplicaRole::Voter),
+        ]);
+        let change = crate::agent_sdk::ManagementRequest::ChangeReplicas {
+            expected_generation: fixture.descriptor.replica_generation(),
+            replicas: grown.clone(),
+        };
+        let change_receipt =
+            clean_management_receipt(&fixture.descriptor, &change, 3, &fixture.authority_key);
+        let expected_generation = crate::agent_sdk::replica_set_generation(
+            &fixture.descriptor.identity,
+            fixture.descriptor.creation_nonce,
+            &grown,
+        );
+        assert!(matches!(
+            manage_live(
+                &mut attachments,
+                agent,
+                &change,
+                &change_receipt,
+                SdkManagementArtifacts::None,
+            ),
+            CleanManagementSubmission::Applied {
+                outcome: crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                    crate::agent_sdk::ManagementReply::ReplicasChanged { generation }
+                )),
+                new_slot: true,
+                ..
+            } if generation == expected_generation
+        ));
+        let all = hosts.iter().collect::<Vec<_>>();
+        assert!(wait_until(std::time::Duration::from_secs(30), || {
+            attachments.iter_mut().flatten().for_each(|attachment| {
+                let _ = attachment.refresh();
+            });
+            committee_converged(&all, agent, &grown)
+        }));
+        for (host, attachment) in hosts.iter().zip(attachments.iter().flatten()) {
+            let host = host.lock().unwrap();
+            assert_eq!(
+                host.show(agent).unwrap().unwrap().local_role,
+                Some(ReplicaRole::Voter)
+            );
+            drop(host);
+            assert!(attachment.attachment_for_test(agent).unwrap().1);
+        }
+        // The promoted observers replayed the complete log: the actor
+        // installed before they were voters is in their directory.
+        for host in &hosts {
+            assert!(
+                replicated_state(host, agent)
+                    .unwrap()
+                    .2
+                    .entries
+                    .iter()
+                    .any(|record| record.entry.actor == entry.actor)
+            );
+        }
+
+        // An exact replay of the completed request is retained, not re-run.
+        assert!(matches!(
+            manage_live(
+                &mut attachments,
+                agent,
+                &change,
+                &change_receipt,
+                SdkManagementArtifacts::None,
+            ),
+            CleanManagementSubmission::Applied {
+                outcome: crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                    crate::agent_sdk::ManagementReply::ReplicasChanged { generation }
+                )),
+                new_slot: false,
+                ..
+            } if generation == expected_generation
+        ));
+
+        drop(all);
+        // Stop one voter: the remaining two still form the new quorum.
+        drop(attachments.pop());
+        drop(hosts.pop());
+        join_live_network(networks.pop().unwrap());
+        let suspend = crate::agent_sdk::ManagementRequest::Suspend {
+            actor: entry.actor,
+            expected_deployment: entry.deployment,
+        };
+        let suspend_receipt =
+            clean_management_receipt(&fixture.descriptor, &suspend, 4, &fixture.authority_key);
+        assert!(matches!(
+            manage_live(
+                &mut attachments,
+                agent,
+                &suspend,
+                &suspend_receipt,
+                SdkManagementArtifacts::None,
+            ),
+            CleanManagementSubmission::Applied {
+                outcome: crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                    crate::agent_sdk::ManagementReply::Suspended(_)
+                )),
+                new_slot: true,
+                ..
+            }
+        ));
+        let survivors = hosts.iter().collect::<Vec<_>>();
+        assert!(wait_until(std::time::Duration::from_secs(30), || {
+            committee_converged(&survivors, agent, &grown)
+        }));
+
+        // Reopen the original voter: its durable ledger keeps the new
+        // committee and its descriptor keeps the adopted roster.
+        let expected_state = replicated_state(&hosts[0], agent).unwrap();
+        drop(survivors);
+        drop(attachments);
+        let first = hosts.remove(0);
+        drop(hosts);
+        drop(Arc::try_unwrap(first).ok().unwrap().into_inner().unwrap());
+        let reopened = Arc::new(Mutex::new(open_native_clean_host_for_seed(
+            &directories[0],
+            &fixture,
+            seeds[0],
+            Arc::clone(&slot),
+        )));
+        assert!(committee_converged(&[&reopened], agent, &grown));
+        assert_eq!(replicated_state(&reopened, agent).unwrap(), expected_state);
+        drop(reopened);
+        for network in networks {
+            join_live_network(network);
+        }
+    }
+
+    /// From one voter, grow to three, then replace every original voter one
+    /// at a time by a spare replica while ordered mutations keep committing.
+    /// Every acknowledged mutation survives each replacement and the final
+    /// state commitment is identical on every surviving replica.
+    ///
+    /// Spares are observers of the initial committee: a node outside it
+    /// cannot open the generation on this branch (see the gap report).
+    #[cfg(all(feature = "network", feature = "pvm"))]
+    #[test]
+    fn signed_change_replicas_replaces_every_voter_without_losing_state() {
+        use crate::network::shared_agent::CleanManagementSubmission;
+
+        let seeds = [0x31_u8, 0x32, 0x33, 0x34, 0x35, 0x36];
+        let mut initial = vec![(0x31, ReplicaRole::Voter)];
+        initial.extend(seeds[1..].iter().map(|seed| (*seed, ReplicaRole::Observer)));
+        let fixture = committee_change_fixture(0x5b, &initial);
+        let agent = fixture.agent;
+        let authority = descriptor_committee_authority(&fixture.descriptor);
+        let slot = Arc::new(AtomicU64::new(20));
+        let directories = seeds
+            .iter()
+            .map(|seed| TempDirectory::new(&format!("committee_rotate_{seed:02x}")))
+            .collect::<Vec<_>>();
+        let mut hosts = seeds
+            .iter()
+            .zip(&directories)
+            .map(|(seed, directory)| {
+                let mut host =
+                    open_native_clean_host_for_seed(directory, &fixture, *seed, Arc::clone(&slot));
+                host.provision(
+                    fixture.provision.clone(),
+                    fixture.catalog.clone(),
+                    authority,
+                )
+                .unwrap();
+                Some(Arc::new(Mutex::new(host)))
+            })
+            .collect::<Vec<_>>();
+        let mut networks = live_mesh(&seeds).into_iter().map(Some).collect::<Vec<_>>();
+        let attachments = hosts
+            .iter()
+            .zip(&networks)
+            .map(|(host, network)| {
+                Some(
+                    crate::network::SharedAgentNetworkHost::attach(
+                        Arc::clone(host.as_ref().unwrap()),
+                        Arc::clone(network.as_ref().unwrap()),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let actor_package = super::super::package_admission::admitted_standard_query_actor_for_test(
+            "committee-rotate-worker",
+            crate::agent_sdk::StateLane::Linear,
+            0x77,
+        );
+        let mut sequence = 2;
+        let mut epoch = 1;
+        let mut descriptor = fixture.descriptor.clone();
+        let install = clean_install_request(fixture.descriptor.identity.agent, &actor_package);
+        let install_receipt =
+            clean_management_receipt(&descriptor, &install, sequence, &fixture.authority_key);
+        sequence += 1;
+        let mut owned = attachments;
+        let CleanManagementSubmission::Applied {
+            outcome:
+                crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                    crate::agent_sdk::ManagementReply::Installed(entry),
+                )),
+            ..
+        } = manage_live(
+            &mut owned,
+            agent,
+            &install,
+            &install_receipt,
+            SdkManagementArtifacts::Actor(&actor_package),
+        )
+        else {
+            panic!("single-voter Install did not apply")
+        };
+        let mut acknowledged = Vec::new();
+        let mut suspended = false;
+
+        // (0) grow to three voters; (1..=3) replace each original voter.
+        let mut voters = vec![0x31_u8];
+        let mut spares = seeds[1..].to_vec();
+        let mut retired = Vec::new();
+        for step in 0..4 {
+            let removed = (step > 0).then(|| voters.remove(0));
+            if let Some(removed) = removed {
+                // The replaced voter is lost: its task and store are gone.
+                let index = seeds.iter().position(|seed| *seed == removed).unwrap();
+                drop(owned[index].take());
+                drop(hosts[index].take());
+                join_live_network(networks[index].take().unwrap());
+                retired.push(removed);
+            }
+            while voters.len() < 3 {
+                voters.push(spares.remove(0));
+            }
+            let mut members = voters
+                .iter()
+                .map(|seed| (*seed, ReplicaRole::Voter))
+                .collect::<Vec<_>>();
+            members.extend(spares.iter().map(|seed| (*seed, ReplicaRole::Observer)));
+            let roster = seeded_roster(&members);
+            let change = crate::agent_sdk::ManagementRequest::ChangeReplicas {
+                expected_generation: descriptor.replica_generation(),
+                replicas: roster.clone(),
+            };
+            // Each stable committee leg advances the ledger's authority epoch;
+            // later decisions keep the epoch of the change they follow.
+            let decision_epoch = epoch;
+            let change_receipt = epoch_management_receipt(
+                &descriptor,
+                &change,
+                sequence,
+                decision_epoch,
+                &fixture.authority_key,
+            );
+            sequence += 1;
+            epoch += 1;
+            assert!(
+                matches!(
+                    manage_live(
+                        &mut owned,
+                        agent,
+                        &change,
+                        &change_receipt,
+                        SdkManagementArtifacts::None,
+                    ),
+                    CleanManagementSubmission::Applied {
+                        outcome: crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                            crate::agent_sdk::ManagementReply::ReplicasChanged { .. }
+                        )),
+                        ..
+                    }
+                ),
+                "step {step} replica change did not complete"
+            );
+            descriptor.replicas = roster.clone();
+
+            // An ordered mutation commits on the new committee.
+            let request = if suspended {
+                crate::agent_sdk::ManagementRequest::Resume {
+                    actor: entry.actor,
+                    expected_deployment: entry.deployment,
+                }
+            } else {
+                crate::agent_sdk::ManagementRequest::Suspend {
+                    actor: entry.actor,
+                    expected_deployment: entry.deployment,
+                }
+            };
+            let receipt = epoch_management_receipt(
+                &descriptor,
+                &request,
+                sequence,
+                decision_epoch,
+                &fixture.authority_key,
+            );
+            sequence += 1;
+            let outcome = manage_live(
+                &mut owned,
+                agent,
+                &request,
+                &receipt,
+                SdkManagementArtifacts::None,
+            );
+            assert!(
+                matches!(
+                    &outcome,
+                    CleanManagementSubmission::Applied {
+                        outcome: crate::agent_sdk::RuntimeOutcome::Management(Ok(_)),
+                        new_slot: true,
+                        ..
+                    }
+                ),
+                "step {step} ordered mutation was not acknowledged"
+            );
+            suspended = !suspended;
+            acknowledged.push((request, receipt));
+
+            // Spare observers receive nothing until a joint configuration
+            // names them, so convergence is asserted on the voters.
+            let voter_hosts = voters
+                .iter()
+                .map(|seed| {
+                    hosts[seeds
+                        .iter()
+                        .position(|candidate| candidate == seed)
+                        .unwrap()]
+                    .as_ref()
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                wait_until(std::time::Duration::from_secs(30), || {
+                    owned.iter_mut().flatten().for_each(|attachment| {
+                        let _ = attachment.refresh();
+                    });
+                    committee_converged(&voter_hosts, agent, &roster)
+                }),
+                "step {step} did not converge"
+            );
+            // Every acknowledged mutation is still in the replicated state.
+            for host in &voter_hosts {
+                let (_, _, actors) = replicated_state(host, agent).unwrap();
+                let record = actors
+                    .entries
+                    .iter()
+                    .find(|record| record.entry.actor == entry.actor)
+                    .expect("installed actor survives replacement");
+                assert_eq!(record.entry.suspended, suspended);
+            }
+        }
+        assert_eq!(retired, vec![0x31, 0x32, 0x33]);
+        assert_eq!(voters, vec![0x34, 0x35, 0x36]);
+        assert!(spares.is_empty());
+
+        // Each acknowledged result is replayable from the final committee:
+        // the exact request and receipt are retained, never applied twice.
+        let (before, history, _) = replicated_state(hosts[3].as_ref().unwrap(), agent).unwrap();
+        if let Some((request, receipt)) = acknowledged.last() {
+            assert!(matches!(
+                manage_live(
+                    &mut owned,
+                    agent,
+                    request,
+                    receipt,
+                    SdkManagementArtifacts::None,
+                ),
+                CleanManagementSubmission::Applied {
+                    new_slot: false,
+                    ..
+                }
+            ));
+        }
+        let survivors = hosts.iter().flatten().collect::<Vec<_>>();
+        for host in &survivors {
+            let (position, survivor_history, _) = replicated_state(host, agent).unwrap();
+            assert_eq!(position, before);
+            assert_eq!(survivor_history, history);
+        }
+        drop(survivors);
+        drop(owned);
+        drop(hosts);
+        for network in networks.into_iter().flatten() {
+            join_live_network(network);
+        }
+    }
+
+    /// Submit one exact clean management request to whichever live replica
+    /// currently leads. Followers and fenced owners refuse without a slot;
+    /// a committee leg is resubmitted until the descriptor leg completes.
+    #[cfg(feature = "network")]
+    fn manage_live(
+        attachments: &mut [Option<crate::network::SharedAgentNetworkHost>],
+        agent: AgentId,
+        request: &crate::agent_sdk::ManagementRequest,
+        receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+        artifacts: SdkManagementArtifacts<'_>,
+    ) -> crate::network::shared_agent::CleanManagementSubmission {
+        use crate::network::shared_agent::CleanManagementSubmission;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let mut last = None;
+        loop {
+            for attachment in attachments.iter_mut().flatten() {
+                let result = attachment.refresh().and_then(|()| {
+                    attachment.manage_clean(agent, request.clone(), receipt.clone(), artifacts)
+                });
+                match result {
+                    Ok(CleanManagementSubmission::CommitteeTransition { .. }) => {}
+                    Ok(done) => return done,
+                    Err(error) => last = Some(error),
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no live replica completed the request; last refusal {last:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
     }
 }

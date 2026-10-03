@@ -82,7 +82,6 @@ const ARTIFACT_CHUNK_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/shared/artifact-batc
 const AGENT_RAFT_COMMAND_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/shared/raft-command/v1";
 const AGENT_RAFT_REPLICATION_ID_DOMAIN: &[u8] = b"vos/agent/shared/raft-replication/v1";
 const AGENT_RAFT_APPLY_RESERVATION_DOMAIN: &[u8] = b"vos/agent/shared/raft-apply-reservation/v1";
-const COMMITTEE_CHANGE_REQUEST_DOMAIN: &[u8] = b"vos/agent/shared/committee-change-request/v2";
 const COMMITTEE_TRANSITION_ID_DOMAIN: &[u8] = b"vos/agent/shared/committee-transition/v2";
 #[cfg(feature = "storage")]
 const AGENT_RAFT_PHYSICAL_SLOT_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/shared/raft-physical-slot/v3";
@@ -602,11 +601,19 @@ impl ServiceWire for ArtifactChunk {
 /// Canonical application command which opens the two-entry Raft membership
 /// barrier for one Shared Agent.
 ///
-/// The authority receipt is the clean SDK receipt: its typed operation must
-/// be `ChangeReplicaSet` and its request hash must cover the stable generation,
-/// both complete committees, and both exact full voter-Node vectors. The
-/// transition ID additionally covers the complete signed receipt, so two
-/// authority decisions for the same membership intent remain distinct.
+/// The authority receipt is the clean SDK `ChangeReplicas` receipt: its typed
+/// operation must be `ChangeReplicaSet` and its request hash must equal the
+/// SDK commitment of `ChangeReplicas { expected_generation, replicas }`,
+/// where `replicas` is the canonical roster of the complete next committee.
+/// Every member identity is bound by that roster: a `NodeId` is the digest of
+/// its canonical Ed25519 PeerId, and both the member key and its Raft slot
+/// are derived from that PeerId. `expected_generation` is the descriptor
+/// replica generation the authority approved replacing; the ledger binds
+/// the previous committee separately by requiring it to be active. The
+/// receipt is checked at the leader-observed logical slot, exactly like an
+/// ordered clean management input. The transition ID additionally covers the
+/// complete signed receipt, so two authority decisions for the same
+/// membership intent remain distinct.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrepareCommitteeChange {
     transition: CommitteeTransitionId,
@@ -615,45 +622,38 @@ pub struct PrepareCommitteeChange {
     next: AgentReplicaCommittee,
     previous_voters: Vec<AgentNodeId>,
     next_voters: Vec<AgentNodeId>,
+    expected_generation: crate::agent_sdk::Hash,
+    observed_slot: u64,
     authority: crate::agent_sdk::authority::AuthorityReceipt,
 }
 
 impl PrepareCommitteeChange {
-    /// Request commitment which an authority actor must sign in a typed
+    /// Exact SDK request an authority actor must approve in a typed
     /// `ChangeReplicaSet` receipt before the preparation can be constructed.
     pub fn authority_request(
         generation: AgentGenerationRouteKey,
         previous: &AgentReplicaCommittee,
         next: &AgentReplicaCommittee,
-    ) -> Result<crate::agent_sdk::Hash, AgentRaftWireError> {
+        expected_generation: crate::agent_sdk::Hash,
+    ) -> Result<crate::agent_sdk::ManagementRequest, AgentRaftWireError> {
         validate_committee_change_scope(generation, previous, next)?;
-        let previous_voters = committee_voter_nodes(previous)?;
-        let next_voters = committee_voter_nodes(next)?;
-        Ok(committee_change_request_commitment(
-            generation,
-            previous,
-            next,
-            &previous_voters,
-            &next_voters,
-        ))
+        committee_voter_nodes(previous)?;
+        committee_voter_nodes(next)?;
+        committee_change_request(next, expected_generation)
     }
 
     pub fn new(
         generation: AgentGenerationRouteKey,
         previous: AgentReplicaCommittee,
         next: AgentReplicaCommittee,
+        expected_generation: crate::agent_sdk::Hash,
+        observed_slot: u64,
         authority: crate::agent_sdk::authority::AuthorityReceipt,
     ) -> Result<Self, AgentRaftWireError> {
         validate_committee_change_scope(generation, &previous, &next)?;
         let previous_voters = committee_voter_nodes(&previous)?;
         let next_voters = committee_voter_nodes(&next)?;
-        let request = committee_change_request_commitment(
-            generation,
-            &previous,
-            &next,
-            &previous_voters,
-            &next_voters,
-        );
+        let request = committee_change_request(&next, expected_generation)?.commitment();
         let transition = committee_transition_id(request, &authority)?;
         let change = Self {
             transition,
@@ -662,6 +662,8 @@ impl PrepareCommitteeChange {
             next,
             previous_voters,
             next_voters,
+            expected_generation,
+            observed_slot,
             authority,
         };
         change.validate()?;
@@ -690,6 +692,16 @@ impl PrepareCommitteeChange {
 
     pub fn next_voters(&self) -> &[AgentNodeId] {
         &self.next_voters
+    }
+
+    /// Descriptor replica generation the authority approved replacing.
+    pub const fn expected_generation(&self) -> crate::agent_sdk::Hash {
+        self.expected_generation
+    }
+
+    /// Leader-observed logical slot at which the receipt is verified.
+    pub const fn observed_slot(&self) -> u64 {
+        self.observed_slot
     }
 
     pub const fn authority(&self) -> &crate::agent_sdk::authority::AuthorityReceipt {
@@ -734,13 +746,8 @@ impl PrepareCommitteeChange {
         {
             return Err(AgentRaftWireError::InvalidAuthorityEvidence);
         }
-        let expected_request = committee_change_request_commitment(
-            self.generation,
-            &self.previous,
-            &self.next,
-            &self.previous_voters,
-            &self.next_voters,
-        );
+        let expected_request =
+            committee_change_request(&self.next, self.expected_generation)?.commitment();
         let selector = &self.authority.selector;
         if selector.operation != AuthorityOperationKind::ChangeReplicaSet
             || selector.space.as_bytes() != &self.generation.space.0
@@ -757,7 +764,7 @@ impl PrepareCommitteeChange {
 }
 
 impl ServiceWire for PrepareCommitteeChange {
-    const MAGIC: [u8; 4] = *b"APC3";
+    const MAGIC: [u8; 4] = *b"APC4";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         use crate::agent_sdk::wire::CanonicalWire as _;
@@ -769,6 +776,8 @@ impl ServiceWire for PrepareCommitteeChange {
         encoder.bytes(&self.next.encode());
         encode_raft_nodes(&mut encoder, &self.previous_voters);
         encode_raft_nodes(&mut encoder, &self.next_voters);
+        encoder.fixed(self.expected_generation.as_bytes());
+        encoder.u64(self.observed_slot);
         // Every constructor and decoder validates this private field. If a
         // future internal mutation violates that invariant, abort at the
         // canonical-record boundary instead of silently substituting bytes
@@ -798,6 +807,8 @@ impl ServiceWire for PrepareCommitteeChange {
             )?,
             previous_voters: decode_raft_nodes(decoder)?,
             next_voters: decode_raft_nodes(decoder)?,
+            expected_generation: crate::agent_sdk::Hash(decoder.fixed()?),
+            observed_slot: decoder.u64()?,
             authority: {
                 let bytes = bounded_bytes(
                     decoder,
@@ -889,21 +900,41 @@ fn decode_raft_nodes(decoder: &mut Decoder<'_>) -> Result<Vec<AgentNodeId>, Deco
     Ok(nodes)
 }
 
-fn committee_change_request_commitment(
-    generation: AgentGenerationRouteKey,
-    previous: &AgentReplicaCommittee,
+/// Canonical SDK replica roster of one complete committee, in node order.
+pub(crate) fn committee_sdk_replicas(
+    committee: &AgentReplicaCommittee,
+) -> Vec<crate::agent_sdk::AgentReplica> {
+    committee
+        .members()
+        .iter()
+        .map(|member| {
+            let replica = member.replica();
+            crate::agent_sdk::AgentReplica {
+                node: crate::agent_sdk::NodeId(replica.node.0),
+                principal: crate::agent_sdk::PrincipalId(replica.principal.0),
+                role: match replica.role {
+                    ReplicaRole::Voter => crate::agent_sdk::ReplicaRole::Voter,
+                    ReplicaRole::Observer => crate::agent_sdk::ReplicaRole::Observer,
+                },
+            }
+        })
+        .collect()
+}
+
+/// The exact SDK `ChangeReplicas` request whose authority receipt admits a
+/// transition to `next`. Production authorities sign this commitment.
+fn committee_change_request(
     next: &AgentReplicaCommittee,
-    previous_voters: &[AgentNodeId],
-    next_voters: &[AgentNodeId],
-) -> crate::agent_sdk::Hash {
-    let mut bytes = Vec::new();
-    let mut encoder = Encoder(&mut bytes);
-    encode_generation_route(&mut encoder, generation);
-    encoder.bytes(&previous.encode());
-    encoder.bytes(&next.encode());
-    encode_raft_nodes(&mut encoder, previous_voters);
-    encode_raft_nodes(&mut encoder, next_voters);
-    crate::agent_sdk::Hash::digest(COMMITTEE_CHANGE_REQUEST_DOMAIN, &[&bytes])
+    expected_generation: crate::agent_sdk::Hash,
+) -> Result<crate::agent_sdk::ManagementRequest, AgentRaftWireError> {
+    let request = crate::agent_sdk::ManagementRequest::ChangeReplicas {
+        expected_generation,
+        replicas: committee_sdk_replicas(next),
+    };
+    if !request.is_valid() {
+        return Err(AgentRaftWireError::InvalidCommitteeTransition);
+    }
+    Ok(request)
 }
 
 fn committee_transition_id(
@@ -2123,17 +2154,24 @@ impl CommitteeChangeAuthorityBinding {
         enforce_wire_bound(&self, MAX_COMMITTEE_AUTHORITY_BINDING_BYTES)
     }
 
+    /// The receipt is verified at the change's leader-observed logical slot,
+    /// the same clock an ordered clean management input uses. A physical
+    /// Raft index is not an authority clock.
     fn verify(
         self,
         generation: AgentGenerationRouteKey,
         expected_epoch: u64,
-        logical_slot: u64,
         change: &PrepareCommitteeChange,
     ) -> Result<(), AgentRaftApplicationErrorV2> {
         use crate::agent_sdk::authority::AuthorityOperationKind;
 
         let receipt = change.authority();
         let selector = &receipt.selector;
+        let logical_slot = change.observed_slot();
+        let expected_request =
+            committee_change_request(change.next(), change.expected_generation())
+                .map_err(|_| AgentRaftApplicationErrorV2::WrongAuthority)?
+                .commitment();
         if change.generation() != generation
             || selector.policy != self.policy
             || selector.issuer != self.issuer
@@ -2143,14 +2181,7 @@ impl CommitteeChangeAuthorityBinding {
             || selector.space.as_bytes() != &generation.space.0
             || selector.agent.as_bytes() != &generation.agent.0
             || selector.epoch != expected_epoch
-            || selector.request
-                != committee_change_request_commitment(
-                    change.generation(),
-                    change.previous(),
-                    change.next(),
-                    change.previous_voters(),
-                    change.next_voters(),
-                )
+            || selector.request != expected_request
         {
             return Err(AgentRaftApplicationErrorV2::WrongAuthority);
         }
@@ -6145,6 +6176,43 @@ mod application_ledger_v2 {
             Ok(self.committee_state()?.authority_epoch)
         }
 
+        /// Whether a fixed-roster recovery command can apply now: the initial
+        /// committee is active and no transition is in flight.
+        pub(crate) fn fixed_roster_recovery_admissible(
+            &self,
+        ) -> Result<bool, AgentRaftApplicationErrorV2> {
+            let state = self.committee_state()?;
+            Ok(state.pending.is_none() && state.active == self.initial_committee)
+        }
+
+        /// Non-mutating admission of a committee preparation against the
+        /// current applied state. It repeats every check the committed
+        /// `PrepareCommitteeChange` apply performs, so a leader never commits
+        /// a preparation that every replica would then refuse to apply.
+        pub(crate) fn preflight_committee_change(
+            &self,
+            change: &PrepareCommitteeChange,
+        ) -> Result<(), AgentRaftApplicationErrorV2> {
+            let state = self.committee_state()?;
+            if change.generation() != self.generation {
+                return Err(AgentRaftApplicationErrorV2::WrongGeneration);
+            }
+            if state.pending.is_some() {
+                return Err(AgentRaftApplicationErrorV2::OverlappingCommitteeChange);
+            }
+            if change.previous() != &state.active {
+                return Err(AgentRaftApplicationErrorV2::StaleCommittee);
+            }
+            if state.authority_epoch == u64::MAX {
+                return Err(AgentRaftApplicationErrorV2::AuthorityEpochExhausted);
+            }
+            if self.recovery_manifest_if_present()?.is_some() {
+                return Err(AgentRaftApplicationErrorV2::TransitionBarrier);
+            }
+            self.authority
+                .verify(self.generation, state.authority_epoch, change)
+        }
+
         /// Derive the exact ledger half of a snapshot claim without mutating
         /// either durable store. The logical boundary is the latest exact
         /// Ordered projection. A contiguous applied suffix after it may
@@ -8221,12 +8289,8 @@ mod application_ledger_v2 {
                         if state.authority_epoch == u64::MAX {
                             return Err(AgentRaftApplicationErrorV2::AuthorityEpochExhausted);
                         }
-                        self.authority.verify(
-                            self.generation,
-                            state.authority_epoch,
-                            slot.index(),
-                            change,
-                        )?;
+                        self.authority
+                            .verify(self.generation, state.authority_epoch, change)?;
                         let mut next_state = state.clone();
                         next_state.pending = Some(PendingCommitteeChangeV2 {
                             change: change.clone(),
@@ -9125,12 +9189,7 @@ mod application_ledger_v2 {
                     return Err(AgentRaftApplicationErrorV2::CorruptLedger);
                 }
                 authority
-                    .verify(
-                        state.generation,
-                        state.authority_epoch,
-                        record.index,
-                        &change,
-                    )
+                    .verify(state.generation, state.authority_epoch, &change)
                     .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
                 state.pending = Some(PendingCommitteeChangeV2 {
                     change,
@@ -11077,6 +11136,13 @@ mod tests {
 
     #[cfg(feature = "storage")]
     const COMMITTEE_AUTHORITY_EPOCH: u64 = 41;
+    /// Descriptor replica generation carried by test committee requests.
+    #[cfg(feature = "storage")]
+    const COMMITTEE_EXPECTED_GENERATION: crate::agent_sdk::Hash =
+        crate::agent_sdk::Hash([0x5e; 32]);
+    /// Leader-observed logical slot of test committee preparations.
+    #[cfg(feature = "storage")]
+    const COMMITTEE_OBSERVED_SLOT: u64 = 1;
 
     #[cfg(feature = "storage")]
     pub(super) fn committee_authority_binding() -> CommitteeChangeAuthorityBinding {
@@ -11135,8 +11201,14 @@ mod tests {
         };
 
         let public_key = signing_key.verifying_key().to_bytes();
-        let request =
-            PrepareCommitteeChange::authority_request(generation, previous, next).unwrap();
+        let request = PrepareCommitteeChange::authority_request(
+            generation,
+            previous,
+            next,
+            COMMITTEE_EXPECTED_GENERATION,
+        )
+        .unwrap()
+        .commitment();
         let mut receipt = AuthorityReceipt {
             selector: AuthorityReceiptSelector {
                 policy,
@@ -11173,7 +11245,15 @@ mod tests {
             signature: [1; 64],
         };
         receipt.signature = signing_key.sign(&receipt.signing_bytes()).to_bytes();
-        PrepareCommitteeChange::new(generation, previous.clone(), next.clone(), receipt).unwrap()
+        PrepareCommitteeChange::new(
+            generation,
+            previous.clone(),
+            next.clone(),
+            COMMITTEE_EXPECTED_GENERATION,
+            COMMITTEE_OBSERVED_SLOT,
+            receipt,
+        )
+        .unwrap()
     }
 
     #[cfg(feature = "storage")]
@@ -11609,6 +11689,8 @@ mod tests {
             generation,
             initial.clone(),
             next.clone(),
+            COMMITTEE_EXPECTED_GENERATION,
+            COMMITTEE_OBSERVED_SLOT,
             different_evidence,
         )
         .unwrap();
@@ -11629,7 +11711,14 @@ mod tests {
         wrong_operation.selector.operation = AuthorityOperationKind::CreateAgent;
         wrong_operation.signature = key(0xe1).sign(&wrong_operation.signing_bytes()).to_bytes();
         assert_eq!(
-            PrepareCommitteeChange::new(generation, initial.clone(), next.clone(), wrong_operation,),
+            PrepareCommitteeChange::new(
+                generation,
+                initial.clone(),
+                next.clone(),
+                COMMITTEE_EXPECTED_GENERATION,
+                COMMITTEE_OBSERVED_SLOT,
+                wrong_operation,
+            ),
             Err(AgentRaftWireError::InvalidAuthorityEvidence)
         );
 
@@ -11637,8 +11726,84 @@ mod tests {
         wrong_request.selector.request = crate::agent_sdk::Hash([0xef; 32]);
         wrong_request.signature = key(0xe1).sign(&wrong_request.signing_bytes()).to_bytes();
         assert_eq!(
-            PrepareCommitteeChange::new(generation, initial, next, wrong_request),
+            PrepareCommitteeChange::new(
+                generation,
+                initial.clone(),
+                next.clone(),
+                COMMITTEE_EXPECTED_GENERATION,
+                COMMITTEE_OBSERVED_SLOT,
+                wrong_request,
+            ),
             Err(AgentRaftWireError::InvalidAuthorityEvidence)
+        );
+
+        // The signed request is exactly the SDK ChangeReplicas request a real
+        // Authority approves: the canonical next roster and the replaced
+        // descriptor replica generation. Neither may be substituted.
+        let sdk_request = crate::agent_sdk::ManagementRequest::ChangeReplicas {
+            expected_generation: COMMITTEE_EXPECTED_GENERATION,
+            replicas: committee_sdk_replicas(&next),
+        };
+        assert!(sdk_request.is_valid());
+        assert_eq!(
+            change.authority().selector.request,
+            sdk_request.commitment()
+        );
+        assert_eq!(
+            PrepareCommitteeChange::authority_request(
+                generation,
+                &initial,
+                &next,
+                COMMITTEE_EXPECTED_GENERATION,
+            )
+            .unwrap(),
+            sdk_request
+        );
+        assert_eq!(change.expected_generation(), COMMITTEE_EXPECTED_GENERATION);
+        assert_eq!(change.observed_slot(), COMMITTEE_OBSERVED_SLOT);
+        assert_eq!(
+            PrepareCommitteeChange::new(
+                generation,
+                initial.clone(),
+                next.clone(),
+                crate::agent_sdk::Hash([0x5f; 32]),
+                COMMITTEE_OBSERVED_SLOT,
+                change.authority().clone(),
+            ),
+            Err(AgentRaftWireError::InvalidAuthorityEvidence),
+            "a different replaced generation is a different signed request"
+        );
+        assert_eq!(
+            PrepareCommitteeChange::new(
+                generation,
+                initial.clone(),
+                committee(&[key(2), key(4)], &[key(8)]),
+                COMMITTEE_EXPECTED_GENERATION,
+                COMMITTEE_OBSERVED_SLOT,
+                change.authority().clone(),
+            ),
+            Err(AgentRaftWireError::InvalidAuthorityEvidence),
+            "a different next roster is a different signed request"
+        );
+        assert_eq!(
+            PrepareCommitteeChange::new(
+                generation,
+                initial.clone(),
+                next.clone(),
+                crate::agent_sdk::Hash::ZERO,
+                COMMITTEE_OBSERVED_SLOT,
+                change.authority().clone(),
+            ),
+            Err(AgentRaftWireError::InvalidCommitteeTransition),
+            "a zero replaced generation is not a canonical SDK request"
+        );
+        // The observed slot is covered by the exact wire bytes.
+        let mut moved = change.clone();
+        moved.observed_slot += 1;
+        assert_ne!(moved.encode(), change.encode());
+        assert_eq!(
+            PrepareCommitteeChange::decode(&moved.encode()).unwrap(),
+            moved
         );
 
         for (wrong_space, wrong_agent) in [
@@ -11660,6 +11825,8 @@ mod tests {
                     generation,
                     change.previous().clone(),
                     change.next().clone(),
+                    COMMITTEE_EXPECTED_GENERATION,
+                    COMMITTEE_OBSERVED_SLOT,
                     wrong_scope,
                 ),
                 Err(AgentRaftWireError::InvalidAuthorityEvidence)
@@ -14126,8 +14293,15 @@ mod tests {
         );
         let mut bad_signature = valid.authority().clone();
         bad_signature.signature[0] ^= 1;
-        let bad_signature =
-            PrepareCommitteeChange::new(generation, initial.clone(), next, bad_signature).unwrap();
+        let bad_signature = PrepareCommitteeChange::new(
+            generation,
+            initial.clone(),
+            next,
+            COMMITTEE_EXPECTED_GENERATION,
+            COMMITTEE_OBSERVED_SLOT,
+            bad_signature,
+        )
+        .unwrap();
         assert_prepare_rejected_without_advance(
             "v2_prepare_bad_signature",
             initial,

@@ -1177,6 +1177,9 @@ fn external_network_lifecycle(
                 CleanManagementSubmission::Denied { outcome, .. } => {
                     panic!("external network Install denied: {outcome:?}")
                 }
+                CleanManagementSubmission::CommitteeTransition { .. } => {
+                    panic!("external network Install changed the committee")
+                }
             })
     });
     assert!(matches!(

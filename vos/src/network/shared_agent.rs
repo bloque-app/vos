@@ -835,6 +835,37 @@ impl AttachmentFingerprint {
             || (implicit_system && (recovering || !fixed_three))
     }
 
+    /// Whether `next` only advances an authorized committee transition this
+    /// attachment already serves: same generation, same active committee
+    /// and local role, a transition is now prepared or joint, and no route
+    /// member is dropped. Such a change must not restart the Raft worker: a
+    /// new leader term would append its no-op between the Prepare and its
+    /// adjacent joint/stable configuration legs, which the ledger refuses.
+    /// The route member set may only grow (by authenticated next members).
+    fn continues_transition(&self, next: &Self, local: NodeId) -> bool {
+        self.protocol_route == next.protocol_route
+            && self.durable_route == next.durable_route
+            && self.local_role == next.local_role
+            && next.next_committee.is_some()
+            && (self.next_committee.is_none() || self.next_committee == next.next_committee)
+            && self.runs_worker(local)
+            && next.runs_worker(local)
+            && next.validates_local(local)
+            && self
+                .members
+                .iter()
+                .all(|member| next.members.contains(member))
+    }
+
+    /// Voters own their consensus worker. An observer runs a passive,
+    /// non-member worker: vos-raft never lets it campaign, and no leader
+    /// replicates to it until an authorized joint configuration names it.
+    /// Without that worker a promoted observer could never receive the
+    /// Prepare entry that tells it it is being promoted.
+    fn runs_worker(&self, local: NodeId) -> bool {
+        self.owns_raft_worker(local) || self.local_role == ReplicaRole::Observer
+    }
+
     fn owns_raft_worker(&self, local: NodeId) -> bool {
         self.voters.binary_search(&local).is_ok()
             || self
@@ -857,6 +888,10 @@ struct SharedRouteHandler {
     route_nodes: Vec<NodeId>,
     worker: Option<vos_raft::WorkerHandle<NodeId>>,
     proposal: Mutex<ProposalAdmission>,
+    /// Set from appending a committee Prepare until this replica has applied
+    /// it. Until then the driver cannot see the pending transition, so every
+    /// ordinary proposal on this owner is refused instead.
+    committee_fence: AtomicBool,
     // RPC timeouts do not cancel a coordinator already collecting votes.
     // Reject concurrent retries instead of queuing duplicate full audits.
     // This excludes only expiry coordination for this Agent, not execution.
@@ -1208,6 +1243,13 @@ pub(crate) enum CleanManagementSubmission {
         observed_slot: u64,
         new_slot: bool,
     },
+    /// The committee leg of a `ChangeReplicas` was appended with its adjacent
+    /// joint configuration. `stable` reports whether this replica applied the
+    /// stable leg before returning. Either way the caller refreshes the
+    /// attachment and resubmits the identical request: once the committee
+    /// runs the roster, the ordinary ordered path updates the descriptor.
+    #[allow(dead_code)] // Read by the operator replica-change command once wired.
+    CommitteeTransition { observed_slot: u64, stable: bool },
 }
 
 fn has_projection_recovery_custody(
@@ -1603,6 +1645,9 @@ impl SharedRouteHandler {
             })?;
         #[cfg(test)]
         trace("host_final_verified");
+        if !host.fixed_roster_recovery_admissible(self.agent)? {
+            return Err(SharedAgentHostError::Conflict);
+        }
         let command = shared_raft::AgentRaftCommand::ExpireRecovery {
             route: status.route,
             certificate,
@@ -1925,6 +1970,9 @@ impl SharedRouteHandler {
         let extra = 2 + u64::from(registration.owner().0 != self.network.agent_node_id().0);
         if remaining < required as u64 + extra {
             return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        if !host.fixed_roster_recovery_admissible(self.agent)? {
+            return Err(SharedAgentHostError::Conflict);
         }
         let command = shared_raft::AgentRaftCommand::RegisterRecovery {
             route: status.route,
@@ -2368,6 +2416,9 @@ impl SharedRouteHandler {
     }
 
     fn has_local_proposer(&self, worker: &vos_raft::WorkerHandle<NodeId>) -> bool {
+        if self.committee_fence.load(Ordering::Acquire) {
+            return false;
+        }
         if worker.role() == vos_raft::Role::Leader {
             return true;
         }
@@ -3301,6 +3352,7 @@ impl SharedRouteHandler {
         request: crate::agent_sdk::ManagementRequest,
         authority: crate::agent_sdk::authority::AuthorityReceipt,
         artifacts: crate::agent::driver::SdkManagementArtifacts<'_>,
+        joining: &[Vec<u8>],
     ) -> Result<CleanManagementSubmission, SharedAgentHostError> {
         let proposal = self
             .proposal
@@ -3322,6 +3374,14 @@ impl SharedRouteHandler {
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             drain_committed(&mut host, self.agent, &self.ordered_replies)?;
+            if let Some(change) =
+                host.prepare_clean_committee_change(self.agent, &request, &authority, joining)?
+            {
+                drop(host);
+                let submission = self.submit_committee_change(worker, change);
+                drop(proposal);
+                return submission;
+            }
             let prepared =
                 host.prepare_clean_management(self.agent, request, authority, artifacts)?;
             let observed_slot = prepared.observed_slot();
@@ -3375,6 +3435,85 @@ impl SharedRouteHandler {
             observed_slot: input.1,
             new_slot: true,
         })
+    }
+
+    /// Append one authorized committee Prepare and, in the same leader term
+    /// and with nothing between them, its joint configuration. The caller
+    /// holds proposal exclusion; the fence keeps every other proposal on
+    /// this owner out until the Prepare is applied here, after which the
+    /// driver itself refuses ordinary commands while the change is pending.
+    /// Every wait is bounded by `ORDERED_REPLY_WAIT`.
+    fn submit_committee_change(
+        &self,
+        worker: &vos_raft::WorkerHandle<NodeId>,
+        change: crate::agent::shared_journal_driver::PreparedCommitteeChange,
+    ) -> Result<CleanManagementSubmission, SharedAgentHostError> {
+        let crate::agent::shared_journal_driver::PreparedCommitteeChange {
+            observed_slot,
+            command,
+            next_voters,
+            next_committee,
+        } = change;
+        self.committee_fence.store(true, Ordering::Release);
+        let Ok(prepare) = futures_executor::block_on(worker.propose(command)) else {
+            // Nothing was appended.
+            self.committee_fence.store(false, Ordering::Release);
+            return Err(SharedAgentHostError::Unavailable);
+        };
+        match futures_executor::block_on(worker.change_membership(next_voters)) {
+            Ok(joint) if Some(joint) == prepare.checked_add(1) => {}
+            // The Prepare is appended without its adjacent joint leg (lost
+            // leadership or an interleaved append). The fence stays up: no
+            // ordinary command may follow it from this owner. A new leader's
+            // no-op cannot complete the transition either; see the barrier
+            // note on `PrepareCommitteeChange`.
+            _ => return Err(SharedAgentHostError::Conflict),
+        }
+        let deadline = Instant::now() + ORDERED_REPLY_WAIT;
+        let mut visible = false;
+        loop {
+            let (pending, active) = {
+                let mut host = self
+                    .host
+                    .lock()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                // A route retired by its stable leg may no longer own the
+                // apply notifier; draining here is the same exact apply.
+                let _ = drain_committed(&mut host, self.agent, &self.ordered_replies);
+                let status = host
+                    .supervisor_attachment_status(self.agent)?
+                    .ok_or(SharedAgentHostError::AgentNotFound)?;
+                (
+                    status
+                        .committee_transition
+                        .as_ref()
+                        .map(|transition| transition.next_committee),
+                    status.route.committee(),
+                )
+            };
+            if active == next_committee {
+                self.committee_fence.store(false, Ordering::Release);
+                return Ok(CleanManagementSubmission::CommitteeTransition {
+                    observed_slot,
+                    stable: true,
+                });
+            }
+            if !visible && pending == Some(next_committee) {
+                visible = true;
+                self.committee_fence.store(false, Ordering::Release);
+            }
+            if Instant::now() >= deadline {
+                return if visible {
+                    Ok(CleanManagementSubmission::CommitteeTransition {
+                        observed_slot,
+                        stable: false,
+                    })
+                } else {
+                    Err(SharedAgentHostError::Unavailable)
+                };
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn pump_merge_once(&self, local: NodeId, stop: &AtomicBool, cursor: &mut usize) {
@@ -6705,7 +6844,9 @@ impl SharedAgentNetworkHost {
         let route = fingerprint.protocol_route;
         #[cfg(test)]
         let raft_isolated = Arc::new(AtomicBool::new(false));
-        let (mut worker, handle, receiver) = if fingerprint.owns_raft_worker(local) {
+        let (mut worker, handle, receiver) = if fingerprint.owns_raft_worker(local)
+            || (!promotion_barrier && fingerprint.runs_worker(local))
+        {
             let database = self
                 .host
                 .lock()
@@ -6743,8 +6884,8 @@ impl SharedAgentNetworkHost {
             let handle = worker.handler();
             (Some(worker), Some(handle), Some(receiver))
         } else {
-            // Observers authenticate and serve Merge/route data but do not
-            // participate in Raft quorum or process Raft RPCs.
+            // Behind a promotion barrier an observer cannot wait for its own
+            // leadership; it serves Merge/route data without a worker.
             (None, None, None)
         };
         if promotion_barrier {
@@ -6914,6 +7055,7 @@ impl SharedAgentNetworkHost {
             route_nodes: fingerprint.members.iter().map(|(node, _)| *node).collect(),
             worker: handle,
             proposal: Mutex::new(initial_admission),
+            committee_fence: AtomicBool::new(false),
             expiry: Mutex::new(()),
             ordered_replies: Arc::clone(&ordered_replies),
             lifecycle: Arc::clone(&lifecycle),
@@ -6928,7 +7070,7 @@ impl SharedAgentNetworkHost {
             let host = Arc::clone(&self.host);
             let network = Arc::clone(&self.network);
             let route_handler = Arc::clone(&handler);
-            let attached_fingerprint = fingerprint.clone();
+            let mut attached_fingerprint = fingerprint.clone();
             let thread_stale = Arc::clone(&stale);
             let thread_merge_stop = Arc::clone(&merge_stop);
             let thread_lifecycle = Arc::clone(&lifecycle);
@@ -6979,6 +7121,40 @@ impl SharedAgentNetworkHost {
                             .and_then(|status| {
                                 AttachmentFingerprint::from_attachment_status(&status).ok()
                             });
+                        if let Some(next) = current.as_ref().filter(|next| {
+                            *next != &attached_fingerprint
+                                && attached_fingerprint.continues_transition(next, local)
+                        }) {
+                            // Keep the worker and its term. Only widen the
+                            // exact route owner to the authenticated next
+                            // members so the leader can replicate to them.
+                            let next = next.clone();
+                            drop(host);
+                            if network
+                                .install_agent_route(
+                                    route,
+                                    next.members.clone(),
+                                    Arc::clone(&route_handler),
+                                )
+                                .is_ok()
+                            {
+                                attached_fingerprint = next;
+                                continue;
+                            }
+                            ordered_replies.fail_all();
+                            thread_stale.store(true, Ordering::Release);
+                            thread_merge_stop.store(true, Ordering::Release);
+                            if let Some(worker) = &thread_worker {
+                                let _ = worker.sender().send(vos_raft::RaftMsg::Shutdown);
+                            }
+                            retire_route_with_lease(
+                                &network,
+                                route,
+                                &route_handler,
+                                &thread_lifecycle,
+                            );
+                            return;
+                        }
                         if current.as_ref() != Some(&attached_fingerprint) {
                             ordered_replies.fail_all();
                             thread_stale.store(true, Ordering::Release);
@@ -7146,6 +7322,30 @@ impl SharedAgentNetworkHost {
             }
             let agent = status.generation.agent();
             let fingerprint = AttachmentFingerprint::from_attachment_status(&status)?;
+            let local = self.network.agent_node_id();
+            if let Some(attached) = self.generations.get_mut(&agent)
+                && !attached.stale.load(Ordering::Acquire)
+                && attached.fingerprint != fingerprint
+                && attached
+                    .fingerprint
+                    .continues_transition(&fingerprint, local)
+            {
+                // A prepared or joint transition advances in place; restarting
+                // the worker would insert a leader no-op inside it.
+                let route = fingerprint.protocol_route;
+                if self
+                    .network
+                    .install_agent_route(
+                        route,
+                        fingerprint.members.clone(),
+                        Arc::clone(&attached.handler),
+                    )
+                    .is_ok()
+                {
+                    attached.fingerprint = fingerprint;
+                    continue;
+                }
+            }
             let rebuild = self.generations.get(&agent).is_some_and(|attached| {
                 attached.stale.load(Ordering::Acquire) || attached.fingerprint != fingerprint
             });
@@ -7931,7 +8131,72 @@ impl SharedAgentNetworkHost {
         }
         attached
             .coordinator
-            .submit_clean_management(request, authority, artifacts)
+            .submit_clean_management(request, authority, artifacts, &[])
+    }
+
+    /// Submit a Shared `ChangeReplicas` whose roster may name nodes outside
+    /// the active committee. Each such node must be given as its canonical
+    /// Ed25519 PeerId; the authority-signed request binds the node, which is
+    /// the digest of that PeerId. Returns `CommitteeTransition` for the
+    /// committee leg and `Applied` once the descriptor adopted the roster.
+    #[allow(dead_code)] // Entry point for the operator replica-change command; no ingress yet.
+    pub(crate) fn manage_clean_with_replicas(
+        &self,
+        agent: crate::service::AgentId,
+        request: crate::agent_sdk::ManagementRequest,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        joining: &[Vec<u8>],
+    ) -> Result<CleanManagementSubmission, SharedAgentHostError> {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        if attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        attached.coordinator.submit_clean_management(
+            request,
+            authority,
+            crate::agent::driver::SdkManagementArtifacts::None,
+            joining,
+        )
+    }
+
+    /// Drive one authorized `ChangeReplicas` on this replica to completion:
+    /// the committee leg, then the descriptor leg through the ordinary
+    /// ordered path. Each attempt refreshes the attachment first, so the
+    /// stable leg's worker restart is observed. The whole call is bounded by
+    /// `deadline`; only this replica's own leadership can make progress.
+    #[allow(dead_code)] // Entry point for the operator replica-change command; no ingress yet.
+    pub(crate) fn change_replicas(
+        &mut self,
+        agent: crate::service::AgentId,
+        request: crate::agent_sdk::ManagementRequest,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        joining: &[Vec<u8>],
+        deadline: Duration,
+    ) -> Result<CleanManagementSubmission, SharedAgentHostError> {
+        if !matches!(
+            request,
+            crate::agent_sdk::ManagementRequest::ChangeReplicas { .. }
+        ) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let deadline = Instant::now() + deadline;
+        loop {
+            let result = self.refresh().and_then(|()| {
+                self.manage_clean_with_replicas(agent, request.clone(), authority.clone(), joining)
+            });
+            match result {
+                Ok(CleanManagementSubmission::CommitteeTransition { .. })
+                | Err(
+                    SharedAgentHostError::Unavailable | SharedAgentHostError::TransportNotAttached,
+                ) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                result => return result,
+            }
+        }
     }
 
     #[cfg(test)]

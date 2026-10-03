@@ -9598,6 +9598,10 @@ fn apply_actor_install(
             observed_slot,
             ..
         } => (outcome, observed_slot),
+        // An Install never moves the committee.
+        crate::network::shared_agent::CleanManagementSubmission::CommitteeTransition { .. } => {
+            return Err(rejected(CleanSystemAgentBootstrapRejection::WrongReply));
+        }
     };
     let super::sdk::RuntimeOutcome::Management(Ok(reply)) = outcome else {
         return Err(rejected(CleanSystemAgentBootstrapRejection::WrongReply));
