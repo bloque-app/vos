@@ -26,7 +26,7 @@ pub const INNER_FIRST_MAPPABLE_PAGE: u32 = 16;
 /// compact program per worker thread, with a bounded admission size. This is
 /// not a program limit; larger programs continue through uncached preparation.
 #[cfg(feature = "std")]
-const MAX_CACHED_INNER_PROGRAM_BYTES: usize = 2 << 20;
+const MAX_CACHED_INNER_PROGRAM_BYTES: usize = 4 << 20;
 
 #[cfg(feature = "std")]
 struct CachedInnerPreparation {

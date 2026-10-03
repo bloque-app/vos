@@ -27,11 +27,13 @@ pub const STANDARD_ACTOR_PROGRAM_BYTES: usize = 1_280 * 1024;
 /// Largest standard actor PVM staged into one runtime work item: the hard
 /// maximum a declared actor may reach. Execution materializes the program
 /// several times beside the state images, so the ceiling is what the bundled
-/// runtime's 32-MiB arena holds at the state ceiling, with margin: at 4 MiB of
-/// state and 31 unacknowledged results a 1 920-KiB program still ran and a
-/// 2 048-KiB one exhausted the arena. Its load stays inside the default
+/// runtime's 32-MiB arena holds at the state ceiling, with margin. Before the
+/// runtime loaded programs in place, a 1 920-KiB program still ran at 4 MiB
+/// of state and 31 unacknowledged results and a 2 048-KiB one exhausted the
+/// arena; loading in place removes about 3.5 program copies from the peak, and
+/// 2 560 KiB runs at the state ceiling. Its load stays inside the default
 /// management gas budget.
-pub const MAX_RUNTIME_PROGRAM_BYTES: usize = 1_792 * 1024;
+pub const MAX_RUNTIME_PROGRAM_BYTES: usize = 2_560 * 1024;
 /// Largest signed actor schema staged alongside the actor PVM.
 pub const MAX_RUNTIME_SCHEMA_BYTES: usize = 16 * 1024;
 /// Largest signed method-policy preimage staged alongside the actor PVM.
