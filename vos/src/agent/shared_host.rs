@@ -12348,6 +12348,75 @@ mod tests {
         true
     }
 
+    /// One line per replica: host committee view, journal position, and the
+    /// live Raft worker's role, term, commit and configuration.
+    #[cfg(feature = "network")]
+    fn replica_diagnostics(
+        host: &Arc<Mutex<SharedAgentHost>>,
+        attachment: Option<&crate::network::SharedAgentNetworkHost>,
+        network: &crate::network::Network,
+        agent: AgentId,
+    ) -> String {
+        let Ok(locked) = host.lock() else {
+            return "host lock poisoned".into();
+        };
+        let node = locked.scope().node;
+        let status = locked.show(agent);
+        let ordered = locked
+            .journal_position(agent)
+            .map(|position| position.ordered_index);
+        let roster = locked
+            .clean_runtime_descriptor(agent)
+            .map(|descriptor| descriptor.replicas.len());
+        drop(locked);
+        let host_view = match &status {
+            Ok(Some(status)) => format!(
+                "role={:?} committee={:?} transition={:?} replicas={:?} applied={} remaining={}",
+                status.local_role,
+                status.route.committee(),
+                status
+                    .committee_transition
+                    .as_ref()
+                    .map(|transition| (transition.next_committee, transition.joint)),
+                status
+                    .replicas
+                    .iter()
+                    .map(|replica| (replica.node, replica.role))
+                    .collect::<Vec<_>>(),
+                status.applied_slots,
+                status.remaining_slots,
+            ),
+            other => format!("status={other:?}"),
+        };
+        let raft = match (
+            &status,
+            attachment.and_then(|attachment| attachment.attachment_for_test(agent)),
+        ) {
+            (Ok(Some(status)), Some((handler, owns_worker))) => {
+                let route = crate::network::agent_protocol::AgentGenerationRoute {
+                    space: crate::agent_sdk::SpaceId(status.generation.space().0),
+                    agent: crate::agent_sdk::AgentId(status.generation.agent().0),
+                    generation: crate::agent_sdk::Hash(status.replication_id),
+                };
+                let reply = crate::network::agent_protocol::authenticate_sender(
+                    &network.peer_id(),
+                    crate::network::agent_protocol::AgentFrame {
+                        route,
+                        sender: network.agent_node_id(),
+                        message: crate::network::agent_protocol::AgentMessage::Raft(
+                            crate::network::agent_protocol::RaftMessage::StatusRequest,
+                        ),
+                    },
+                )
+                .map(|request| handler.handle(request));
+                format!("worker={owns_worker} raft={reply:?}")
+            }
+            (_, None) => "not attached".into(),
+            _ => "no status".into(),
+        };
+        format!("node={node:?} {host_view} ordered={ordered:?} roster={roster:?} {raft}")
+    }
+
     #[cfg(feature = "pvm")]
     fn committee_change_fixture(nonce: u8, replicas: &[(u8, ReplicaRole)]) -> Fixture {
         let runtime = super::super::package_admission::admitted_scripted_runtime_for_test(
@@ -12755,12 +12824,25 @@ mod tests {
             } if generation == expected_generation
         ));
         let all = hosts.iter().collect::<Vec<_>>();
-        assert!(wait_until(std::time::Duration::from_secs(30), || {
+        let converged = wait_until(std::time::Duration::from_secs(30), || {
             attachments.iter_mut().flatten().for_each(|attachment| {
                 let _ = attachment.refresh();
             });
             committee_converged(&all, agent, &grown)
-        }));
+        });
+        assert!(
+            converged,
+            "growth did not converge:\n{}",
+            hosts
+                .iter()
+                .zip(&attachments)
+                .zip(&networks)
+                .map(|((host, attachment), network)| {
+                    replica_diagnostics(host, attachment.as_ref(), network, agent)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
         for (host, attachment) in hosts.iter().zip(attachments.iter().flatten()) {
             let host = host.lock().unwrap();
             assert_eq!(
@@ -12830,9 +12912,22 @@ mod tests {
             }
         ));
         let survivors = hosts.iter().collect::<Vec<_>>();
-        assert!(wait_until(std::time::Duration::from_secs(30), || {
+        let converged = wait_until(std::time::Duration::from_secs(30), || {
             committee_converged(&survivors, agent, &grown)
-        }));
+        });
+        assert!(
+            converged,
+            "survivors did not converge:\n{}",
+            hosts
+                .iter()
+                .zip(&attachments)
+                .zip(&networks)
+                .map(|((host, attachment), network)| {
+                    replica_diagnostics(host, attachment.as_ref(), network, agent)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
 
         // Reopen the original voter: its durable ledger keeps the new
         // committee and its descriptor keeps the adopted roster.
@@ -13152,6 +13247,7 @@ mod tests {
             };
             let mut receipt = next_receipt(&change, change_epoch);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            let mut last;
             loop {
                 slot.fetch_add(1, Ordering::SeqCst);
                 match manage_once(&attachments, agent, &change, &receipt, joining) {
@@ -13161,14 +13257,23 @@ mod tests {
                                 crate::agent_sdk::ManagementReply::ReplicasChanged { .. },
                             )),
                         ..
-                    }) => return,
-                    Ok(CleanManagementSubmission::CommitteeTransition { .. }) | Err(_) => {}
-                    Ok(_) => receipt = next_receipt(&change, change_epoch),
+                    }) => return Ok(()),
+                    Ok(CleanManagementSubmission::CommitteeTransition { stable, .. }) => {
+                        last = format!("committee leg pending (stable={stable})");
+                    }
+                    Err(error) => last = format!("refused: {error:?}"),
+                    Ok(CleanManagementSubmission::Denied { outcome, .. }) => {
+                        last = format!("denied: {outcome:?}");
+                        receipt = next_receipt(&change, change_epoch);
+                    }
+                    Ok(CleanManagementSubmission::Applied { outcome, .. }) => {
+                        last = format!("applied without change: {outcome:?}");
+                        receipt = next_receipt(&change, change_epoch);
+                    }
                 }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "replica change to {roster:?} did not complete"
-                );
+                if std::time::Instant::now() >= deadline {
+                    return Err(last);
+                }
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
         };
@@ -13191,33 +13296,49 @@ mod tests {
         let converge = |voters: &[Arc<Mutex<SharedAgentHost>>],
                         roster: &[crate::agent_sdk::AgentReplica]| {
             let voters = voters.iter().collect::<Vec<_>>();
-            assert!(
-                wait_until(std::time::Duration::from_secs(60), || {
-                    attachments
-                        .lock()
-                        .unwrap()
-                        .iter_mut()
-                        .flatten()
-                        .for_each(|attachment| {
-                            let _ = attachment.refresh();
-                        });
-                    committee_converged(&voters, agent, roster)
-                }),
-                "voters did not converge on {roster:?}"
-            );
+            wait_until(std::time::Duration::from_secs(60), || {
+                attachments
+                    .lock()
+                    .unwrap()
+                    .iter_mut()
+                    .flatten()
+                    .for_each(|attachment| {
+                        let _ = attachment.refresh();
+                    });
+                committee_converged(&voters, agent, roster)
+            })
+        };
+        let diagnose = |hosts: &[Option<Arc<Mutex<SharedAgentHost>>>],
+                        networks: &[Option<Arc<crate::network::Network>>]| {
+            let attachments = attachments.lock().unwrap();
+            hosts
+                .iter()
+                .zip(attachments.iter())
+                .zip(networks)
+                .filter_map(|((host, attachment), network)| {
+                    Some(replica_diagnostics(
+                        host.as_ref()?,
+                        attachment.as_ref(),
+                        network.as_ref()?,
+                        agent,
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         };
 
         // Wait until a mutation is acknowledged in `wanted`, which also proves
         // a leader exists among the live voters.
         let await_ack = |wanted: usize| {
-            assert!(
-                wait_until(std::time::Duration::from_secs(60), || {
-                    last_ack.load(Ordering::Acquire) == wanted + 1
-                }),
-                "no mutation acknowledged in phase {wanted}"
-            );
+            wait_until(std::time::Duration::from_secs(60), || {
+                last_ack.load(Ordering::Acquire) == wanted + 1
+            })
         };
-        await_ack(0);
+        assert!(
+            await_ack(0),
+            "no mutation acknowledged in phase 0:\n{}",
+            diagnose(&hosts, &networks)
+        );
 
         // (1) Grow 1 -> 3 with two brand-new nodes.
         for seed in [0x61, 0x62] {
@@ -13236,10 +13357,21 @@ mod tests {
             (0x62, ReplicaRole::Voter),
         ]);
         phase.store(1, Ordering::Release);
-        drive_change(&grown, fixture.descriptor.replica_generation(), 1, &joining);
+        if let Err(last) =
+            drive_change(&grown, fixture.descriptor.replica_generation(), 1, &joining)
+        {
+            panic!(
+                "growth did not complete ({last}):\n{}",
+                diagnose(&hosts, &networks)
+            );
+        }
         epoch.store(2, Ordering::SeqCst);
         let mut voters = vec![GENESIS, 0x61, 0x62];
-        converge(&live_voters(&hosts, &seeds, &voters), &grown);
+        assert!(
+            converge(&live_voters(&hosts, &seeds, &voters), &grown),
+            "growth did not converge:\n{}",
+            diagnose(&hosts, &networks)
+        );
         let grown_generation = crate::agent_sdk::replica_set_generation(
             &fixture.descriptor.identity,
             fixture.descriptor.creation_nonce,
@@ -13260,13 +13392,21 @@ mod tests {
             drop(hosts[index].take());
             join_live_network(networks[index].take().unwrap());
         };
-        await_ack(1);
+        assert!(
+            await_ack(1),
+            "no mutation acknowledged in phase 1:\n{}",
+            diagnose(&hosts, &networks)
+        );
         kill(0x62, &seeds, &mut hosts, &mut networks);
         voters.retain(|seed| *seed != 0x62);
         phase.store(2, Ordering::Release);
         // Never change membership across a leader change: wait for the
         // survivors to elect a leader and commit before starting the change.
-        await_ack(2);
+        assert!(
+            await_ack(2),
+            "no mutation acknowledged in phase 2:\n{}",
+            diagnose(&hosts, &networks)
+        );
         start_joiner(
             0x63,
             &mut seeds,
@@ -13279,17 +13419,30 @@ mod tests {
             (0x61, ReplicaRole::Voter),
             (0x63, ReplicaRole::Voter),
         ]);
-        drive_change(&replaced, grown_generation, 2, &[peer_id(&key(0x63))]);
+        if let Err(last) = drive_change(&replaced, grown_generation, 2, &[peer_id(&key(0x63))]) {
+            panic!(
+                "replacement did not complete ({last}):\n{}",
+                diagnose(&hosts, &networks)
+            );
+        }
         epoch.store(3, Ordering::SeqCst);
         voters.push(0x63);
-        converge(&live_voters(&hosts, &seeds, &voters), &replaced);
+        assert!(
+            converge(&live_voters(&hosts, &seeds, &voters), &replaced),
+            "replacement did not converge:\n{}",
+            diagnose(&hosts, &networks)
+        );
         let replaced_generation = crate::agent_sdk::replica_set_generation(
             &fixture.descriptor.identity,
             fixture.descriptor.creation_nonce,
             &replaced,
         );
         phase.store(3, Ordering::Release);
-        await_ack(3);
+        assert!(
+            await_ack(3),
+            "no mutation acknowledged in phase 3:\n{}",
+            diagnose(&hosts, &networks)
+        );
 
         // (3) The next replacement is refused before any slot is used: the
         // removed voter never acknowledges its retirement.
@@ -13297,7 +13450,11 @@ mod tests {
         voters.retain(|seed| *seed != 0x61);
         phase.store(4, Ordering::Release);
         // Two of three voters still elect and commit.
-        await_ack(4);
+        assert!(
+            await_ack(4),
+            "no mutation acknowledged in phase 4:\n{}",
+            diagnose(&hosts, &networks)
+        );
         start_joiner(
             0x64,
             &mut seeds,
@@ -13317,16 +13474,17 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             slot.fetch_add(1, Ordering::SeqCst);
+            let attempt = manage_once(
+                &attachments,
+                agent,
+                &blocked,
+                &blocked_receipt,
+                &[peer_id(&key(0x64))],
+            );
             assert!(
-                manage_once(
-                    &attachments,
-                    agent,
-                    &blocked,
-                    &blocked_receipt,
-                    &[peer_id(&key(0x64))],
-                )
-                .is_err(),
-                "a membership change with an unacknowledged retirement must be refused"
+                attempt.is_err(),
+                "a membership change with an unacknowledged retirement must be refused:\n{}",
+                diagnose(&hosts, &networks)
             );
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
@@ -13351,7 +13509,11 @@ mod tests {
                 "no mutation was acknowledged in phase {wanted}"
             );
         }
-        converge(&survivors, &replaced);
+        assert!(
+            converge(&survivors, &replaced),
+            "survivors did not converge:\n{}",
+            diagnose(&hosts, &networks)
+        );
 
         // No acknowledged mutation is lost: each exact decision is retained
         // with its acknowledged result on every surviving voter, and the

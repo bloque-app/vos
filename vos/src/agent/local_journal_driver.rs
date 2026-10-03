@@ -1338,6 +1338,9 @@ pub(crate) struct StandardLocalReplayExecutor<R> {
     merge: Arc<dyn LocalMergeAuthenticator>,
     profile: AgentProfile,
     shared_committees: BTreeMap<AgentReplicaCommitteeId, AgentReplicaCommittee>,
+    /// The local Shared replica is an explicit joiner outside the genesis
+    /// descriptor's roster; its ledger, not the descriptor, admits it.
+    shared_joiner: bool,
     management_gas: Gas,
     last_management_result: Option<(ReplayInputId, Result<LifecycleReply, LifecycleError>)>,
     pending_clean_invocation_results: BTreeMap<ReplayInputId, crate::agent_sdk::RuntimeOutcome>,
@@ -1583,13 +1586,14 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             AgentProfile::Private => crate::agent_sdk::AgentProfile::Private,
         };
         let local_node = self.merge.node();
+        let named = descriptor
+            .replicas
+            .iter()
+            .any(|replica| replica.node.0 == local_node.0);
         if descriptor.validate().is_err()
             || descriptor.identity.profile != expected_profile
             || (self.profile == AgentProfile::Local && descriptor.replicas.len() != 1)
-            || !descriptor
-                .replicas
-                .iter()
-                .any(|replica| replica.node.0 == local_node.0)
+            || named == (self.shared_joiner && self.profile == AgentProfile::Shared)
         {
             return Err(LocalReplayExecutorError::InvalidState);
         }
@@ -1638,6 +1642,12 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         descriptor.runtime_contract = runtime.manifest().contract;
         descriptor.capabilities = runtime.capabilities();
         Ok(descriptor)
+    }
+
+    /// Execute for an explicit Shared joiner: the local node must be absent
+    /// from the genesis descriptor, which never names it.
+    pub(crate) fn admit_shared_joiner(&mut self) {
+        self.shared_joiner = self.profile == AgentProfile::Shared;
     }
 
     pub(crate) fn seeded_clean_descriptor(&self) -> Option<&crate::agent_sdk::AgentDescriptor> {
@@ -2271,6 +2281,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             recent_clean_management_results: BTreeMap::new(),
             recent_clean_management_order: VecDeque::new(),
             clean_genesis_descriptor: None,
+            shared_joiner: false,
             authenticated_execution: None,
             attested_transition_provider: None,
             allow_attested_preparation: false,
@@ -2311,6 +2322,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             recent_clean_management_results: BTreeMap::new(),
             recent_clean_management_order: VecDeque::new(),
             clean_genesis_descriptor: None,
+            shared_joiner: false,
             authenticated_execution: None,
             attested_transition_provider: None,
             allow_attested_preparation: false,
@@ -5561,6 +5573,7 @@ where
             merge,
             vec![committee.clone()],
         );
+        executor.admit_shared_joiner();
         let prepared = ReplayPreparedGenesis::prepare(
             provision.proposal().create().clone(),
             member,

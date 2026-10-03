@@ -1005,9 +1005,6 @@ pub(crate) enum CommitteeChangeRefusal {
     TransitionPending,
     /// The request does not replace the current descriptor replica generation.
     StaleGeneration,
-    /// The active committee changed, but the descriptor has not yet adopted it
-    /// through its ordered `ChangeReplicas`.
-    DescriptorLag,
     /// The descriptor may adopt a roster only after the committee runs it.
     CommitteeChangeRequired,
     /// A requested node is neither an active member nor supplied with a
@@ -1448,6 +1445,9 @@ where
             merge.clone(),
             committees,
         );
+        if ledger.is_joiner() {
+            executor.admit_shared_joiner();
+        }
         if let Some(provider) = provider {
             executor.replace_attested_transition_provider(provider);
         }
@@ -1675,6 +1675,9 @@ where
             self.replay_merge.clone(),
             self.ledger.committee_history()?,
         );
+        if self.ledger.is_joiner() {
+            executor.admit_shared_joiner();
+        }
         let setup_us = started.elapsed().as_micros() as u64;
         let materialize_started = std::time::Instant::now();
         #[cfg(feature = "experimental-state-blocks")]
@@ -1867,12 +1870,20 @@ where
     /// runtime binding and admitted package. Supervisor projections must use
     /// this value rather than the immutable genesis descriptor so a runtime
     /// upgrade invalidates every older readiness generation.
+    /// The trusted descriptor derives from genesis and the runtime binding,
+    /// which never sees a replica change. A Shared roster is the ledger's
+    /// active committee, the only authority-verified record of it.
     pub(crate) fn clean_descriptor(
         &self,
     ) -> Result<crate::agent_sdk::AgentDescriptor, SharedJournalDriverError> {
-        self.executor
-            .trusted_current_clean_descriptor(self.materialization.runtime())
-            .map_err(Into::into)
+        let mut descriptor = self
+            .executor
+            .trusted_current_clean_descriptor(self.materialization.runtime())?;
+        if descriptor.identity.profile == crate::agent_sdk::AgentProfile::Shared {
+            descriptor.replicas =
+                super::shared_raft::committee_sdk_replicas(&self.ledger.active_committee()?);
+        }
+        Ok(descriptor)
     }
 
     /// Resolve the current actor and every immutable invocation artifact from
@@ -3402,10 +3413,18 @@ where
         if descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared {
             return Err(SharedJournalDriverError::InvalidProfile);
         }
-        if descriptor.replicas != super::shared_raft::committee_sdk_replicas(&active) {
-            return refuse(CommitteeChangeRefusal::DescriptorLag);
-        }
-        if *expected_generation != descriptor.replica_generation() {
+        // The host descriptor is genesis-derived; the current roster is the
+        // active committee. The runtime checks the same generation against
+        // its own descriptor when the descriptor leg applies, and an
+        // Authority approves a change only after the previous one's
+        // `ReplicasChanged` acknowledgement.
+        if *expected_generation
+            != crate::agent_sdk::replica_set_generation(
+                &descriptor.identity,
+                descriptor.creation_nonce,
+                &super::shared_raft::committee_sdk_replicas(&active),
+            )
+        {
             return refuse(CommitteeChangeRefusal::StaleGeneration);
         }
         let observed_slot = self.executor.current_logical_slot()?;
