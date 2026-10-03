@@ -1434,27 +1434,42 @@ fn curve_precompile_native(
             output.as_mut_ptr() as u64,
         )
     };
-    // SAFETY: the three buffers live across the call; the host writes only the
-    // 32 output bytes and leaves the argument registers unchanged.
-    unsafe {
-        core::arch::asm!(
-            "csrw 0x801, zero",
-            "ecall",
-            in("t0") id,
-            inlateout("a0") a0 => _,
-            inlateout("a1") a1 => _,
-            inlateout("a2") a2 => _,
-            in("a3") 0u64,
-            in("a4") 0u64,
-            in("a5") crate::abi::pvm::ecall::VOS_OBJECT_CAP,
-            options(nostack),
-        );
+    // The PVM compiler turns `ecall` into `ecalli` only for an immediate host-call id
+    // in t0, so each id gets its own call site.
+    macro_rules! outer_call {
+        ($id:literal) => {
+            // SAFETY: the three buffers live across the call; the host writes only the
+            // 32 output bytes and leaves the argument registers unchanged.
+            unsafe {
+                core::arch::asm!(
+                    "csrw 0x801, zero",
+                    "ecall",
+                    in("t0") $id,
+                    inlateout("a0") a0 => _,
+                    inlateout("a1") a1 => _,
+                    inlateout("a2") a2 => _,
+                    in("a3") 0u64,
+                    in("a4") 0u64,
+                    in("a5") crate::abi::pvm::ecall::VOS_OBJECT_CAP,
+                    options(nostack),
+                )
+            }
+        };
+    }
+    match id {
+        110 => outer_call!(110u64),
+        111 => outer_call!(111u64),
+        112 => outer_call!(112u64),
+        113 => outer_call!(113u64),
+        114 => outer_call!(114u64),
+        _ => return Err(ActorExecutionError::UnsupportedHostCall(id)),
     }
     machine
         .write(pointer(output_register)?, &output)
         .map_err(|_| ActorExecutionError::InvalidInput)
 }
 
+#[cfg(feature = "agent-runtime")]
 #[cfg_attr(all(feature = "runtime-native-curve", target_arch = "riscv64"), allow(dead_code))]
 fn curve_precompile(
     machine: &mut super::machine::ActorMachine,

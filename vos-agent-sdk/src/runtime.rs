@@ -31,9 +31,13 @@ pub const STANDARD_ACTOR_PROGRAM_BYTES: usize = 1_280 * 1024;
 /// runtime loaded programs in place, a 1 920-KiB program still ran at 4 MiB
 /// of state and 31 unacknowledged results and a 2 048-KiB one exhausted the
 /// arena; loading in place removes about 3.5 program copies from the peak, and
-/// 2 560 KiB runs at the state ceiling. Its load stays inside the default
-/// management gas budget.
-pub const MAX_RUNTIME_PROGRAM_BYTES: usize = 2_560 * 1024;
+/// 2 560 KiB runs at the state ceiling. Hashing it once (one decode copy, no
+/// ProgramId or public-I/O pass over it) leaves room for 4 608 KiB, which an
+/// actor built for speed rather than size (`opt-level = 3`) needs; measured
+/// with small state, not yet at the 4 MiB state ceiling. Under the VOS-native
+/// profile the program is one looked-up copy. Its load stays inside the
+/// default management gas budget.
+pub const MAX_RUNTIME_PROGRAM_BYTES: usize = 4_608 * 1024;
 /// Largest signed actor schema staged alongside the actor PVM.
 pub const MAX_RUNTIME_SCHEMA_BYTES: usize = 16 * 1024;
 /// Largest signed method-policy preimage staged alongside the actor PVM.
