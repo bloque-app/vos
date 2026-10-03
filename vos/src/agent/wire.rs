@@ -2470,6 +2470,31 @@ pub fn apply_standard_runtime_input_committed(
     Ok((apply_decoded_standard_runtime_work(work)?, commitment))
 }
 
+/// [`apply_standard_runtime_input_committed`] for a runtime that commits its
+/// public I/O only when a proof will consume it: the work's by-reference
+/// commitment is returned for every non-Direct execution context, and `None`
+/// for Direct work, whose executors read the output window alone and never
+/// the public-I/O registers. Skipping it saves two hash passes over the
+/// state image (one in the work, one in the transition) per invocation.
+#[cfg(feature = "pvm")]
+pub fn apply_standard_runtime_input_committed_unless_direct(
+    input: &[u8],
+) -> Result<
+    (
+        crate::agent_sdk::RuntimeTransition,
+        Option<crate::agent_sdk::Hash>,
+    ),
+    DecodeError,
+> {
+    use crate::agent_sdk::wire::CanonicalWire as _;
+
+    let work =
+        crate::agent_sdk::RuntimeWork::decode(input).map_err(|_| DecodeError::NonCanonical)?;
+    let commitment = (!work.execution_context().is_direct())
+        .then(|| crate::agent_sdk::wire::runtime_work_reference_commitment(&work));
+    Ok((apply_decoded_standard_runtime_work(work)?, commitment))
+}
+
 #[cfg(feature = "pvm")]
 fn apply_decoded_standard_runtime_work(
     work: crate::agent_sdk::RuntimeWork,
