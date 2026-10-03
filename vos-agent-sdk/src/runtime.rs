@@ -7,8 +7,8 @@ use crate::private::{PrivateActorLifecycleKind, PrivateControlRecord};
 use crate::{
     ActorDirectoryPage, ActorEntry, ActorId, ActorLifecycleDebt, AgentDescriptor, AgentIdentity,
     AgentReplica, BlobRef, CallId, CapabilityId, CredentialId, DeploymentId, Hash, InstallActor,
-    InvocationId, MethodMode, NodeId, PrincipalId, ProducerId, ProgramId, RuntimeCapabilities,
-    SpaceId, StateLane, UpgradeActor,
+    InvocationId, InvocationResultStorage, MethodMode, NodeId, PrincipalId, ProducerId, ProgramId,
+    RuntimeCapabilities, SpaceId, StateLane, UpgradeActor,
 };
 
 pub const MAX_INVOCATION_MESSAGE_BYTES: usize = 16 * 1024;
@@ -998,6 +998,84 @@ impl InvocationAcknowledgement {
             && self.deployment != DeploymentId::ZERO
             && self.work != Hash::ZERO
             && self.authorization != Hash::ZERO
+    }
+}
+
+/// Prefix of every sequenced invocation identity.
+pub const SEQUENCED_INVOCATION_PREFIX: [u8; 16] = *b"vos/sequenced/v1";
+
+/// An invocation identity that states its own position in one Agent's
+/// per-result-storage sequence.
+///
+/// Arbitrary identities remain valid and keep their unconditional retained
+/// retirement fact. A sequenced identity additionally lets the standard
+/// runtime replace the oldest contiguous acknowledgements of one result
+/// storage by a watermark once that storage's acknowledgement component is
+/// full: an identity at or below the watermark is refused as divergent and
+/// never becomes unseen work again. The identity is a pure function of
+/// `(storage, sequence)`, so no second identity can name a retired position.
+///
+/// Layout: 16-byte [`SEQUENCED_INVOCATION_PREFIX`], one storage tag byte
+/// (Control 0, Linear 1, Merge 2, Local 3), seven zero bytes, then the
+/// nonzero big-endian sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SequencedInvocation {
+    pub storage: InvocationResultStorage,
+    pub sequence: core::num::NonZeroU64,
+}
+
+/// Classification of an invocation identity against the sequenced layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SequencedInvocationId {
+    /// Not a sequenced identity: exact retirement facts are never compacted.
+    Unsequenced,
+    Sequenced(SequencedInvocation),
+    /// Carries the sequenced prefix without the canonical layout.
+    Malformed,
+}
+
+impl SequencedInvocation {
+    pub const fn new(storage: InvocationResultStorage, sequence: core::num::NonZeroU64) -> Self {
+        Self { storage, sequence }
+    }
+
+    pub fn invocation_id(self) -> InvocationId {
+        let mut bytes = [0u8; 32];
+        bytes[..16].copy_from_slice(&SEQUENCED_INVOCATION_PREFIX);
+        bytes[16] = sequenced_storage_tag(self.storage);
+        bytes[24..].copy_from_slice(&self.sequence.get().to_be_bytes());
+        InvocationId(bytes)
+    }
+
+    pub fn classify(invocation: InvocationId) -> SequencedInvocationId {
+        let bytes = invocation.0;
+        if bytes[..16] != SEQUENCED_INVOCATION_PREFIX {
+            return SequencedInvocationId::Unsequenced;
+        }
+        let storage = match bytes[16] {
+            0 => InvocationResultStorage::Control,
+            1 => InvocationResultStorage::Lane(StateLane::Linear),
+            2 => InvocationResultStorage::Lane(StateLane::Merge),
+            3 => InvocationResultStorage::Lane(StateLane::Local),
+            _ => return SequencedInvocationId::Malformed,
+        };
+        if bytes[17..24] != [0; 7] {
+            return SequencedInvocationId::Malformed;
+        }
+        let sequence = u64::from_be_bytes(bytes[24..].try_into().expect("eight bytes"));
+        match core::num::NonZeroU64::new(sequence) {
+            Some(sequence) => SequencedInvocationId::Sequenced(Self { storage, sequence }),
+            None => SequencedInvocationId::Malformed,
+        }
+    }
+}
+
+const fn sequenced_storage_tag(storage: InvocationResultStorage) -> u8 {
+    match storage {
+        InvocationResultStorage::Control => 0,
+        InvocationResultStorage::Lane(StateLane::Linear) => 1,
+        InvocationResultStorage::Lane(StateLane::Merge) => 2,
+        InvocationResultStorage::Lane(StateLane::Local) => 3,
     }
 }
 

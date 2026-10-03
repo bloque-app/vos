@@ -127,6 +127,11 @@ impl<'a> Decoder<'a> {
         self.bytes.len().saturating_sub(self.pos)
     }
 
+    /// The next `len` bytes without consuming them, if that many remain.
+    pub(crate) fn peek(&self, len: usize) -> Option<&'a [u8]> {
+        self.bytes.get(self.pos..self.pos.checked_add(len)?)
+    }
+
     pub(crate) fn take(&mut self, len: usize) -> Result<&'a [u8], DecodeError> {
         let end = self
             .pos

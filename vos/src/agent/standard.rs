@@ -25,6 +25,11 @@ pub const MAX_INVOCATION_RESULTS_PER_LANE: usize = 32;
 /// persisted result component. Positive facts are never evicted: a full
 /// component rejects the next acknowledgement before retiring its terminal
 /// result, preserving exact retry evidence without an unbounded tombstone log.
+/// The one exception is a sequenced invocation identity
+/// ([`crate::agent_sdk::SequencedInvocation`]): when the component is full, the
+/// fact at the component's next sequence position is replaced by the
+/// component's retirement watermark, which refuses that identity forever
+/// without retaining it.
 pub const MAX_INVOCATION_ACKNOWLEDGEMENTS_PER_LANE: usize = MAX_INVOCATION_RESULTS_PER_LANE;
 pub const MAX_INVOCATION_RESULT_BYTES_PER_LANE: usize = 64 * 1024;
 pub const MAX_AUTHORITY_DISPOSITIONS: usize = 256;
@@ -203,6 +208,8 @@ pub struct StandardAgentRuntime {
     /// checkpoints, and are encoded in the same physical component as the
     /// result they replaced.
     clean_invocation_acknowledgements: Vec<crate::agent_sdk::InvocationAcknowledgement>,
+    /// Per-component watermark of compacted sequenced retirement facts.
+    sequenced_retired_through: StandardSequencedRetirement,
     /// Cooperative actor slices ordered by `(owning component, ready_sequence)`.
     /// A yielded slice moves to the tail of its component queue on every
     /// subsequent yield, providing deterministic FIFO round-robin behavior.
@@ -248,6 +255,9 @@ pub struct StandardRuntimeState {
     pub invocation_results: Vec<StandardInvocationResult>,
     pub(crate) clean_invocation_errors: Vec<StandardCleanInvocationError>,
     pub clean_invocation_acknowledgements: Vec<crate::agent_sdk::InvocationAcknowledgement>,
+    /// Zero in every component unless sequenced retirement facts were
+    /// compacted, so images that never compact encode byte-identically.
+    pub sequenced_retired_through: StandardSequencedRetirement,
     pub(crate) machine_continuations: Vec<StandardMachineContinuation>,
     pub lane_revisions: StandardLaneRevisions,
     pub control_authority_slot: Option<u64>,
@@ -1079,6 +1089,59 @@ fn is_system_authority_projection_query(
         && message.encode() == work.message[1..]
 }
 
+/// Highest sequence position whose retirement fact each result component has
+/// compacted. Every sequenced identity at or below it was accepted and
+/// retired; it is refused as divergent and can never become unseen work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StandardSequencedRetirement {
+    pub control: u64,
+    pub linear: u64,
+    pub merge: u64,
+    pub local: u64,
+}
+
+impl StandardSequencedRetirement {
+    pub fn get(self, storage: InvocationResultStorage) -> u64 {
+        match storage {
+            InvocationResultStorage::Control => self.control,
+            InvocationResultStorage::Lane(StateLane::Linear) => self.linear,
+            InvocationResultStorage::Lane(StateLane::Merge) => self.merge,
+            InvocationResultStorage::Lane(StateLane::Local) => self.local,
+        }
+    }
+
+    fn set(&mut self, storage: InvocationResultStorage, value: u64) {
+        *match storage {
+            InvocationResultStorage::Control => &mut self.control,
+            InvocationResultStorage::Lane(StateLane::Linear) => &mut self.linear,
+            InvocationResultStorage::Lane(StateLane::Merge) => &mut self.merge,
+            InvocationResultStorage::Lane(StateLane::Local) => &mut self.local,
+        } = value;
+    }
+}
+
+/// The sequence position a clean identity names in `mode`'s own result
+/// component: `Ok(None)` for an unsequenced identity, `Err` for a malformed
+/// one or one naming another component.
+fn clean_sequenced_position(
+    invocation: crate::agent_sdk::InvocationId,
+    mode: crate::agent_sdk::MethodMode,
+) -> Result<Option<u64>, crate::agent_sdk::InvocationError> {
+    use crate::agent_sdk::{SequencedInvocation, SequencedInvocationId};
+    match SequencedInvocation::classify(invocation) {
+        SequencedInvocationId::Unsequenced => Ok(None),
+        SequencedInvocationId::Malformed => {
+            Err(crate::agent_sdk::InvocationError::DivergentInvocation)
+        }
+        SequencedInvocationId::Sequenced(sequenced) => {
+            if sequenced.storage != mode.result_storage() {
+                return Err(crate::agent_sdk::InvocationError::DivergentInvocation);
+            }
+            Ok(Some(sequenced.sequence.get()))
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StandardLaneRevisions {
     pub linear: u64,
@@ -1230,6 +1293,12 @@ impl StandardAgentRuntime {
             invocation_results: BTreeMap::new(),
             clean_invocation_errors: BTreeMap::new(),
             clean_invocation_acknowledgements: Vec::new(),
+            sequenced_retired_through: StandardSequencedRetirement {
+                control: 0,
+                linear: 0,
+                merge: 0,
+                local: 0,
+            },
             machine_continuations: Vec::new(),
             lane_revisions: StandardLaneRevisions {
                 linear: 0,
@@ -1344,6 +1413,7 @@ impl StandardAgentRuntime {
             invocation_results: self.invocation_results.values().cloned().collect(),
             clean_invocation_errors: self.clean_invocation_errors.values().cloned().collect(),
             clean_invocation_acknowledgements: self.clean_invocation_acknowledgements.clone(),
+            sequenced_retired_through: self.sequenced_retired_through,
             machine_continuations: self.machine_continuations.clone(),
             lane_revisions: self.lane_revisions,
             control_authority_slot: self.control_authority_slot,
@@ -1409,6 +1479,7 @@ impl StandardAgentRuntime {
                 && state.invocation_results.is_empty()
                 && state.clean_invocation_errors.is_empty()
                 && state.clean_invocation_acknowledgements.is_empty()
+                && state.sequenced_retired_through == StandardSequencedRetirement::default()
                 && state.machine_continuations.is_empty()
                 && state.lane_revisions == StandardLaneRevisions::default()
                 && state.control_authority_slot.is_none()
@@ -1932,6 +2003,20 @@ impl StandardAgentRuntime {
                 .clean_invocation_acknowledgements
                 .push(acknowledgement);
         }
+        runtime.sequenced_retired_through = state.sequenced_retired_through;
+        for storage in [
+            InvocationResultStorage::Control,
+            InvocationResultStorage::Lane(StateLane::Linear),
+            InvocationResultStorage::Lane(StateLane::Merge),
+            InvocationResultStorage::Lane(StateLane::Local),
+        ] {
+            if runtime.sequenced_retired_through.get(storage) != 0
+                && (runtime.clean_descriptor.is_none()
+                    || !runtime.result_storage_supported(storage))
+            {
+                return Err(LifecycleError::InvalidRequest);
+            }
+        }
         for continuation in state.machine_continuations {
             let actor = runtime.actors.get(&continuation.actor);
             let clean_target_valid = match (&continuation.accepted, &continuation.authorization) {
@@ -1984,6 +2069,34 @@ impl StandardAgentRuntime {
                 return Err(LifecycleError::InvalidRequest);
             }
             runtime.machine_continuations.push(continuation);
+        }
+        // No retained clean record may name a compacted or foreign position.
+        if !runtime
+            .invocation_results
+            .values()
+            .filter_map(|result| result.clean.as_ref().map(|binding| &binding.accepted))
+            .chain(
+                runtime
+                    .clean_invocation_errors
+                    .values()
+                    .map(|error| &error.binding.accepted),
+            )
+            .chain(
+                runtime
+                    .machine_continuations
+                    .iter()
+                    .filter_map(|continuation| continuation.accepted.as_ref()),
+            )
+            .map(|accepted| (accepted.invocation, accepted.mode))
+            .chain(
+                runtime
+                    .clean_invocation_acknowledgements
+                    .iter()
+                    .map(|item| (item.invocation, item.mode)),
+            )
+            .all(|(invocation, mode)| runtime.sequenced_position_is_live(invocation, mode))
+        {
+            return Err(LifecycleError::InvalidRequest);
         }
         for storage in [
             InvocationResultStorage::Control,
@@ -2267,6 +2380,26 @@ impl StandardAgentRuntime {
             return Err(LifecycleError::UnsupportedRuntime);
         }
         Ok(())
+    }
+
+    /// Whether a clean identity may still be retained: unsequenced, or a
+    /// sequenced position of its own component above that component's
+    /// compaction watermark.
+    fn sequenced_position_is_live(
+        &self,
+        invocation: crate::agent_sdk::InvocationId,
+        mode: crate::agent_sdk::MethodMode,
+    ) -> bool {
+        match clean_sequenced_position(invocation, mode) {
+            Ok(None) => true,
+            Ok(Some(position)) => {
+                position
+                    > self
+                        .sequenced_retired_through
+                        .get(clean_method_mode(mode).result_storage())
+            }
+            Err(_) => false,
+        }
     }
 
     fn result_storage_supported(&self, storage: InvocationResultStorage) -> bool {
@@ -4522,6 +4655,17 @@ impl StandardAgentRuntime {
             item.invocation == work.invocation
                 && clean_method_mode(item.mode).invocation_scope() == scope
         }) else {
+            // A compacted sequenced fact is summarized by its component's
+            // watermark. It remains consumed: every caller of this recovery
+            // refuses it exactly as it refuses a retained divergent fact.
+            if let Some(position) = clean_sequenced_position(work.invocation, work.mode)?
+                && position
+                    <= self
+                        .sequenced_retired_through
+                        .get(clean_method_mode(work.mode).result_storage())
+            {
+                return Err(InvocationError::DivergentInvocation);
+            }
             return Ok(None);
         };
         if retained.actor != work.actor
@@ -4711,17 +4855,53 @@ impl StandardAgentRuntime {
             return Ok(acknowledgement);
         }
         let storage = clean_method_mode(work.mode).result_storage();
-        if self
+        // At capacity, only the component's next sequence position may be
+        // compacted: the new fact itself or a retained one. Anything else
+        // (an unsequenced fact, or a gap below the oldest retained position)
+        // keeps today's fail-closed refusal.
+        let compaction = if self
             .clean_invocation_acknowledgements
             .iter()
             .filter(|item| clean_method_mode(item.mode).result_storage() == storage)
             .count()
             >= MAX_INVOCATION_ACKNOWLEDGEMENTS_PER_LANE
         {
-            return Err(InvocationError::ResultCapacity);
-        }
+            let next = self
+                .sequenced_retired_through
+                .get(storage)
+                .checked_add(1)
+                .ok_or(InvocationError::ResultCapacity)?;
+            if clean_sequenced_position(acknowledgement.invocation, acknowledgement.mode)?
+                == Some(next)
+            {
+                Some((next, None))
+            } else {
+                let retained = self
+                    .clean_invocation_acknowledgements
+                    .iter()
+                    .position(|item| {
+                        clean_method_mode(item.mode).result_storage() == storage
+                            && clean_sequenced_position(item.invocation, item.mode)
+                                == Ok(Some(next))
+                    })
+                    .ok_or(InvocationError::ResultCapacity)?;
+                Some((next, Some(retained)))
+            }
+        } else {
+            None
+        };
         self.invocation_results.remove(&key);
         self.clean_invocation_errors.remove(&key);
+        if let Some((next, retained)) = compaction {
+            self.sequenced_retired_through.set(storage, next);
+            match retained {
+                // The watermark now refuses this identity; no fact is kept.
+                None => return Ok(acknowledgement),
+                Some(index) => {
+                    self.clean_invocation_acknowledgements.remove(index);
+                }
+            }
+        }
         let storage_tag = clean_acknowledgement_storage_tag(acknowledgement.mode);
         let insertion = self
             .clean_invocation_acknowledgements
