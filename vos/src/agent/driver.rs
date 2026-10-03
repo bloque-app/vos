@@ -6343,6 +6343,8 @@ mod tests {
         );
     }
 
+    // Its install request comes from `wire::tests`, which builds it only with `pvm`.
+    #[cfg(feature = "pvm")]
     #[test]
     fn clean_host_preflight_distinguishes_retained_historical_from_unseen_stale_receipts() {
         use crate::agent_sdk::authority::{
