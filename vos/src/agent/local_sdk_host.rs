@@ -30,6 +30,8 @@ use super::driver::{
 };
 use super::package_admission::AdmittedRuntimePackage;
 
+mod export;
+
 /// Clean-generation logical time required by SDK receipt verification.
 ///
 /// The adapter below deliberately supplies no legacy authority or package
@@ -4609,5 +4611,185 @@ mod tests {
         };
         assert_eq!(reply.status, sdk::InvocationStatus::Done);
         assert_eq!(reply.reply, [2]);
+    }
+
+    fn root_tree(root: &Path) -> Vec<PathBuf> {
+        fn walk(root: &Path, path: &Path, output: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                output.push(entry.path().strip_prefix(root).unwrap().to_path_buf());
+                if entry.file_type().unwrap().is_dir() {
+                    walk(root, &entry.path(), output);
+                }
+            }
+        }
+        let mut output = Vec::new();
+        walk(root, root, &mut output);
+        output.sort();
+        output
+    }
+
+    #[test]
+    fn physical_local_export_imports_same_identity_into_a_cold_standby_root() {
+        let directory = TestDirectory::new("local-rehost");
+        let source_root = directory.child("source");
+        let standby_root = directory.child("standby");
+        let foreign_root = directory.child("foreign");
+        let (slot, trust) = clock_trust(1);
+        let mut source =
+            LocalAgentHost::create(&source_root, space(), node(), trust.clone()).unwrap();
+        let runtime = admitted_runtime();
+        let descriptor = descriptor(&runtime, 7, AgentProfile::Local, space(), node());
+        let agent = source
+            .create_agent(runtime, descriptor.clone(), create_receipt(&descriptor, 10))
+            .unwrap();
+        let actor_package = admitted_actor();
+        let install = install_request(&descriptor, &actor_package);
+        let install_receipt = management_receipt(&descriptor, &install, 2, 1, 2);
+        slot.store(2, Ordering::SeqCst);
+        let installed = source
+            .manage(
+                agent,
+                install,
+                Some(install_receipt),
+                SdkManagementArtifacts::Actor(&actor_package),
+            )
+            .unwrap();
+        assert!(matches!(
+            installed,
+            RuntimeOutcome::Management(Ok(ManagementReply::Installed(_)))
+        ));
+        let page = source
+            .manage(
+                agent,
+                ManagementRequest::InspectActors {
+                    after: None,
+                    limit: 8,
+                },
+                None,
+                SdkManagementArtifacts::None,
+            )
+            .unwrap();
+        let RuntimeOutcome::Management(Ok(ManagementReply::Actors(page))) = page else {
+            panic!("inspect did not return the canonical directory")
+        };
+        let record = page.entries.first().unwrap().clone();
+        slot.store(50, Ordering::SeqCst);
+        let work = invocation(&descriptor, &record, &actor_package, 0xa1);
+        let authorization = sdk::InvocationAuthorization::AuthorityReceipt(invocation_receipt(
+            &descriptor,
+            &work,
+            50,
+            50,
+        ));
+        let completed = source
+            .invoke(agent, work.clone(), authorization.clone())
+            .unwrap();
+        assert!(matches!(completed, RuntimeOutcome::Completed(Ok(_))));
+        let source_image = source.agents[&agent].driver.image().clone();
+
+        // An idle open host exports deterministically; a checked-out Agent
+        // is busy and cannot be copied mid-transition.
+        let bundle = source.export_agent(agent).unwrap();
+        assert_eq!(source.export_agent(agent).unwrap(), bundle);
+        assert_eq!(
+            source.export_agent(AgentId([0x44; 32])),
+            Err(LocalAgentHostError::NotFound)
+        );
+        let shared = Arc::new(Mutex::new(source));
+        let lease = LocalAgentHost::checkout(&shared, agent).unwrap();
+        assert_eq!(
+            shared.lock().unwrap().export_agent(agent),
+            Err(LocalAgentHostError::Busy)
+        );
+        drop(lease);
+        // The source machine is lost; only the bundle and node key survive.
+        drop(shared);
+
+        let mut standby =
+            LocalAgentHost::create(&standby_root, space(), node(), trust.clone()).unwrap();
+        let pristine = root_tree(&standby_root);
+        let mut flipped = bundle.clone();
+        let middle = flipped.len() / 2;
+        flipped[middle] ^= 1;
+        assert_eq!(
+            standby.import_agent(&flipped),
+            Err(LocalAgentHostError::Corrupt)
+        );
+        // A resealed image mutation passes the digest but not re-admission.
+        let mut resealed = bundle.clone();
+        resealed[4 + 2 + 32 + 32 + 32 + 4 + 64] ^= 1;
+        export::reseal_for_test(&mut resealed);
+        assert!(standby.import_agent(&resealed).is_err());
+        assert!(standby.import_agent(&bundle[..bundle.len() - 1]).is_err());
+        assert_eq!(root_tree(&standby_root), pristine, "refusal never mutates");
+        assert!(standby.list().unwrap().is_empty());
+
+        // Another node identity cannot adopt a Local Agent.
+        let mut foreign =
+            LocalAgentHost::create(&foreign_root, space(), NodeId([0x23; 32]), trust.clone())
+                .unwrap();
+        let foreign_pristine = root_tree(&foreign_root);
+        assert_eq!(
+            foreign.import_agent(&bundle),
+            Err(LocalAgentHostError::InvalidScope)
+        );
+        assert_eq!(root_tree(&foreign_root), foreign_pristine);
+        drop(foreign);
+
+        assert_eq!(standby.import_agent(&bundle), Ok(agent));
+        assert_eq!(standby.list().unwrap(), [agent]);
+        assert_eq!(standby.show(agent).unwrap(), &descriptor);
+        assert_eq!(standby.agents[&agent].driver.image(), &source_image);
+        let imported = root_tree(&standby_root);
+        assert_eq!(standby.import_agent(&bundle), Ok(agent), "idempotent");
+        assert_eq!(root_tree(&standby_root), imported);
+        assert_eq!(standby.export_agent(agent).unwrap(), bundle);
+
+        // The exact expired retry returns the retained source outcome, and
+        // the next invocation continues from the source state.
+        slot.store(100, Ordering::SeqCst);
+        assert_eq!(
+            standby
+                .invoke(agent, work.clone(), authorization.clone())
+                .unwrap(),
+            completed
+        );
+        assert_eq!(standby.agents[&agent].driver.image(), &source_image);
+        assert!(matches!(
+            standby
+                .acknowledge_sdk(agent, work.clone(), authorization.clone())
+                .unwrap(),
+            RuntimeOutcome::Acknowledged(Ok(_))
+        ));
+        let next = invocation(&descriptor, &record, &actor_package, 0xa2);
+        let next_authorization = sdk::InvocationAuthorization::AuthorityReceipt(
+            invocation_receipt(&descriptor, &next, 100, 100),
+        );
+        let continued = standby
+            .invoke(agent, next.clone(), next_authorization.clone())
+            .unwrap();
+        let RuntimeOutcome::Completed(Ok(reply)) = &continued else {
+            panic!("standby invoke did not complete: {continued:?}")
+        };
+        assert_eq!(reply.status, sdk::InvocationStatus::Done);
+        let continued_image = standby.agents[&agent].driver.image().clone();
+        assert!(continued_image.revision > source_image.revision);
+
+        drop(standby);
+        let mut standby = LocalAgentHost::open(&standby_root, space(), node(), trust).unwrap();
+        assert_eq!(standby.agents[&agent].driver.image(), &continued_image);
+        assert_eq!(
+            standby.invoke(agent, next, next_authorization).unwrap(),
+            continued
+        );
+        // The stale bundle cannot overwrite the advanced standby slot.
+        let advanced = root_tree(&standby_root);
+        assert_eq!(
+            standby.import_agent(&bundle),
+            Err(LocalAgentHostError::AlreadyExists)
+        );
+        assert_eq!(root_tree(&standby_root), advanced);
+        assert_eq!(standby.agents[&agent].driver.image(), &continued_image);
     }
 }
