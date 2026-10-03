@@ -643,6 +643,7 @@ fn admitted_actor_program(program: Vec<u8>) -> AdmittedActorPackage {
                 scheduling: false,
                 proof_systems: sdk::ProofSystemSet::EMPTY,
             },
+            resources: None,
             signing: package_signing(),
         }),
         artifacts,

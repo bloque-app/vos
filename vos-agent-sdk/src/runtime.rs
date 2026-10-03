@@ -20,8 +20,18 @@ pub const MAX_RUNTIME_AVAILABILITY_ITEMS: usize = 16;
 /// accommodates the complete bounded clean-Create genesis provision, including
 /// the maximum replica roster; inline actor state has a separate smaller cap.
 pub const MAX_RUNTIME_CALLER_AVAILABILITY_BYTES: usize = 192 * 1024;
-/// Largest standard actor PVM staged into one runtime work item.
-pub const MAX_RUNTIME_PROGRAM_BYTES: usize = 1_280 * 1024;
+/// Largest actor PVM a package may carry without declaring its resources
+/// ([`crate::package::ActorResources`]), and the ceiling an Agent's owner
+/// admits new installations under unless it chooses a higher one.
+pub const STANDARD_ACTOR_PROGRAM_BYTES: usize = 1_280 * 1024;
+/// Largest standard actor PVM staged into one runtime work item: the hard
+/// maximum a declared actor may reach. Execution materializes the program
+/// several times beside the state images, so the ceiling is what the bundled
+/// runtime's 32-MiB arena holds at the state ceiling, with margin: at 4 MiB of
+/// state and 31 unacknowledged results a 1 920-KiB program still ran and a
+/// 2 048-KiB one exhausted the arena. Its load stays inside the default
+/// management gas budget.
+pub const MAX_RUNTIME_PROGRAM_BYTES: usize = 1_792 * 1024;
 /// Largest signed actor schema staged alongside the actor PVM.
 pub const MAX_RUNTIME_SCHEMA_BYTES: usize = 16 * 1024;
 /// Largest signed method-policy preimage staged alongside the actor PVM.

@@ -308,6 +308,24 @@ pub(super) fn run_with_signer(
     );
     artifacts.sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
 
+    // Above the standard actor profile the package declares what its
+    // program encodes, so a large actor is a signed, visible choice that the
+    // installing owner admits against its own ceilings.
+    let resources = if actor_pvm.len() > sdk::STANDARD_ACTOR_PROGRAM_BYTES {
+        if actor_pvm.len() > sdk::MAX_RUNTIME_PROGRAM_BYTES {
+            bail!(
+                "actor program is {} B; the runtime maximum is {} B",
+                actor_pvm.len(),
+                sdk::MAX_RUNTIME_PROGRAM_BYTES,
+            );
+        }
+        Some(
+            vos::agent::package_admission::actor_program_resources(&actor_pvm)
+                .ok_or_else(|| anyhow!("actor program is not a standard PVM"))?,
+        )
+    } else {
+        None
+    };
     let name = args.name.unwrap_or(actor_metadata.actor_name);
     let mut package = sdk::package::PackageEnvelope {
         manifest: sdk::package::PackageManifest::Actor(sdk::package::ActorPackageManifest {
@@ -320,6 +338,7 @@ pub(super) fn run_with_signer(
             task_dependencies: task_set_reference,
             scheduling: args.scheduling,
             requirements,
+            resources,
             signing: sdk::package::PackageSigning {
                 producer,
                 public_key,

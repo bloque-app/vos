@@ -409,6 +409,7 @@ pub(crate) fn compiled_install_fixture(
                 scheduling: false,
                 proof_systems: sdk::ProofSystemSet::EMPTY,
             },
+            resources: None,
             signing: PackageSigning {
                 producer: sdk::ProducerId::of_public_key(&public_key),
                 public_key,

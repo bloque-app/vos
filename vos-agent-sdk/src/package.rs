@@ -75,6 +75,43 @@ impl PackageSigning {
     }
 }
 
+/// Resources an actor package declares when it needs more than the standard
+/// actor profile.
+///
+/// Every value restates what the signed program already fixes: its length
+/// (also [`ActorPackageManifest::program`]'s `len`), its zero-initialised
+/// read-write pages (the standard program's heap pages, which contain the
+/// actor's allocator arena) and its stack. A declaration therefore adds no
+/// execution rule and enters the package identity like any manifest field.
+/// It makes a large actor a signed, visible choice of its producer, which an
+/// Agent's owner then admits, or refuses, against its own ceilings before
+/// installing it. Packages without one keep the released manifest encoding
+/// and may carry at most [`crate::STANDARD_ACTOR_PROGRAM_BYTES`] of program
+/// at admission for install.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActorResources {
+    pub program_bytes: u32,
+    pub heap_bytes: u32,
+    pub stack_bytes: u32,
+}
+
+impl ActorResources {
+    /// Declared page granularity of heap and stack.
+    pub const PAGE_BYTES: u32 = 4096;
+    /// Largest heap a standard program header can encode (`u16` pages).
+    pub const MAX_HEAP_BYTES: u32 = u16::MAX as u32 * Self::PAGE_BYTES;
+    /// Largest stack a standard program header can encode (`E3`).
+    pub const MAX_STACK_BYTES: u32 = (1 << 24) - 1;
+
+    pub const fn is_valid(self) -> bool {
+        self.program_bytes != 0
+            && self.program_bytes as usize <= crate::MAX_RUNTIME_PROGRAM_BYTES
+            && self.heap_bytes % Self::PAGE_BYTES == 0
+            && self.heap_bytes <= Self::MAX_HEAP_BYTES
+            && self.stack_bytes <= Self::MAX_STACK_BYTES
+    }
+}
+
 /// Actor-only manifest. There is deliberately no runtime package or runtime
 /// program field: runtime selection is an installation-time compatibility
 /// decision and cannot be pinned by an actor package.
@@ -95,6 +132,8 @@ pub struct ActorPackageManifest {
     /// a client contract and never sets this value implicitly.
     pub scheduling: bool,
     pub requirements: RuntimeRequirements,
+    /// Absent for the released actor manifest tag; see [`ActorResources`].
+    pub resources: Option<ActorResources>,
     pub signing: PackageSigning,
 }
 
@@ -160,7 +199,12 @@ impl PackageManifest {
         match self {
             Self::Actor(manifest) => {
                 validate_name(&manifest.name)?;
-                if !manifest.contract.is_valid() {
+                if !manifest.contract.is_valid()
+                    || manifest.resources.is_some_and(|resources| {
+                        !resources.is_valid()
+                            || u64::from(resources.program_bytes) != manifest.program.len
+                    })
+                {
                     return Err(PackageError::InvalidManifest);
                 }
                 references
@@ -870,7 +914,9 @@ fn decode_signing(decoder: &mut Decoder<'_>) -> Result<PackageSigning, DecodeErr
 fn encode_manifest(encoder: &mut Encoder<'_>, manifest: &PackageManifest, include_signature: bool) {
     match manifest {
         PackageManifest::Actor(manifest) => {
-            encoder.u8(0);
+            // Released tag 0 retains its exact byte/signature format; tag 3
+            // is the same manifest with its declared resources.
+            encoder.u8(if manifest.resources.is_some() { 3 } else { 0 });
             encoder.string(&manifest.name);
             encode_blob(encoder, &manifest.program);
             encode_actor_contract(encoder, manifest.contract);
@@ -880,6 +926,11 @@ fn encode_manifest(encoder: &mut Encoder<'_>, manifest: &PackageManifest, includ
             encode_blob(encoder, &manifest.task_dependencies);
             encoder.bool(manifest.scheduling);
             encode_requirements(encoder, manifest.requirements);
+            if let Some(resources) = manifest.resources {
+                encoder.u32(resources.program_bytes);
+                encoder.u32(resources.heap_bytes);
+                encoder.u32(resources.stack_bytes);
+            }
             encode_signing(encoder, &manifest.signing, include_signature);
         }
         PackageManifest::AgentRuntime(manifest) => {
@@ -902,20 +953,37 @@ fn encode_manifest(encoder: &mut Encoder<'_>, manifest: &PackageManifest, includ
     }
 }
 
+fn decode_actor_manifest(
+    decoder: &mut Decoder<'_>,
+    declared: bool,
+) -> Result<PackageManifest, DecodeError> {
+    Ok(PackageManifest::Actor(ActorPackageManifest {
+        name: decoder.string_bounded(MAX_PACKAGE_NAME_BYTES)?,
+        program: decode_blob(decoder)?,
+        contract: decode_actor_contract(decoder)?,
+        state_lane_schema: decode_blob(decoder)?,
+        method_policy: decode_blob(decoder)?,
+        introspection: decode_blob(decoder)?,
+        task_dependencies: decode_blob(decoder)?,
+        scheduling: decoder.bool()?,
+        requirements: decode_requirements(decoder)?,
+        resources: if declared {
+            Some(ActorResources {
+                program_bytes: decoder.u32()?,
+                heap_bytes: decoder.u32()?,
+                stack_bytes: decoder.u32()?,
+            })
+        } else {
+            None
+        },
+        signing: decode_signing(decoder)?,
+    }))
+}
+
 fn decode_manifest(decoder: &mut Decoder<'_>) -> Result<PackageManifest, DecodeError> {
     match decoder.u8()? {
-        0 => Ok(PackageManifest::Actor(ActorPackageManifest {
-            name: decoder.string_bounded(MAX_PACKAGE_NAME_BYTES)?,
-            program: decode_blob(decoder)?,
-            contract: decode_actor_contract(decoder)?,
-            state_lane_schema: decode_blob(decoder)?,
-            method_policy: decode_blob(decoder)?,
-            introspection: decode_blob(decoder)?,
-            task_dependencies: decode_blob(decoder)?,
-            scheduling: decoder.bool()?,
-            requirements: decode_requirements(decoder)?,
-            signing: decode_signing(decoder)?,
-        })),
+        0 => decode_actor_manifest(decoder, false),
+        3 => decode_actor_manifest(decoder, true),
         1 => Ok(PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
             name: decoder.string_bounded(MAX_PACKAGE_NAME_BYTES)?,
             outer_program: decode_blob(decoder)?,
@@ -970,7 +1038,8 @@ fn manifest_encoded_len(
                     + 1
                     + 1
                     + 1
-                    + manifest.requirements.proof_systems.len() * 32,
+                    + manifest.requirements.proof_systems.len() * 32
+                    + if manifest.resources.is_some() { 12 } else { 0 },
             )
             .ok_or(PackageError::LimitExceeded),
         PackageManifest::AgentRuntime(manifest) => common
@@ -1182,6 +1251,7 @@ mod tests {
                     ])
                     .unwrap(),
                 },
+                resources: None,
                 signing: unsigned_signing(),
             }),
             artifacts: sorted_artifacts(&[
@@ -1239,6 +1309,7 @@ mod tests {
                     scheduling: false,
                     proof_systems: ProofSystemSet::EMPTY,
                 },
+                resources: None,
                 signing: unsigned_signing(),
             }),
             artifacts: sorted_artifacts(&[program, &schema, &policy, &introspection, &task_set]),
@@ -1602,6 +1673,7 @@ mod tests {
             task_dependencies: _,
             scheduling: _,
             requirements: _,
+            resources: _,
             signing: _,
         } = manifest;
     }
@@ -1632,6 +1704,122 @@ mod tests {
         });
         assert!(envelope.encode().is_err());
         assert!(PackageEnvelope::decode(&encode_unchecked(&envelope)).is_err());
+    }
+
+    #[test]
+    fn undeclared_actor_manifest_keeps_the_released_tag_and_bytes() {
+        let envelope = actor_package();
+        let PackageManifest::Actor(manifest) = &envelope.manifest else {
+            unreachable!()
+        };
+        let mut legacy = Vec::new();
+        let mut encoder = Encoder(&mut legacy);
+        encoder.u8(0);
+        encoder.string(&manifest.name);
+        encode_blob(&mut encoder, &manifest.program);
+        encode_actor_contract(&mut encoder, manifest.contract);
+        encode_blob(&mut encoder, &manifest.state_lane_schema);
+        encode_blob(&mut encoder, &manifest.method_policy);
+        encode_blob(&mut encoder, &manifest.introspection);
+        encode_blob(&mut encoder, &manifest.task_dependencies);
+        encoder.bool(manifest.scheduling);
+        encode_requirements(&mut encoder, manifest.requirements);
+        encode_signing(&mut encoder, &manifest.signing, true);
+        let mut current = Vec::new();
+        encode_manifest(&mut Encoder(&mut current), &envelope.manifest, true);
+        assert_eq!(current, legacy);
+        assert_eq!(envelope.encode().unwrap()[4 + 2 + 32], 0);
+    }
+
+    fn declared(envelope: &PackageEnvelope, heap_bytes: u32, stack_bytes: u32) -> ActorResources {
+        let PackageManifest::Actor(manifest) = &envelope.manifest else {
+            unreachable!()
+        };
+        ActorResources {
+            program_bytes: u32::try_from(manifest.program.len).unwrap(),
+            heap_bytes,
+            stack_bytes,
+        }
+    }
+
+    #[test]
+    fn declared_actor_resources_are_signed_under_their_own_tag() {
+        let mut envelope = actor_package();
+        let resources = declared(&envelope, 4 * 1024 * 1024, 256 * 1024);
+        let PackageManifest::Actor(manifest) = &mut envelope.manifest else {
+            unreachable!()
+        };
+        manifest.resources = Some(resources);
+        let signed = sign(envelope);
+        let bytes = signed.encode().unwrap();
+        assert_eq!(bytes[4 + 2 + 32], 3);
+        assert_eq!(PackageEnvelope::decode(&bytes).unwrap(), signed);
+        signed.verify(&TestVerifier).unwrap();
+        // The declaration is part of what the producer signs and of the
+        // deployment identity: the same package undeclared is another package.
+        let mut undeclared = signed.clone();
+        let PackageManifest::Actor(manifest) = &mut undeclared.manifest else {
+            unreachable!()
+        };
+        manifest.resources = None;
+        assert_ne!(
+            undeclared.deployment_id().unwrap(),
+            signed.deployment_id().unwrap()
+        );
+        assert!(undeclared.verify(&TestVerifier).is_err());
+    }
+
+    #[test]
+    fn declared_actor_resources_must_restate_a_representable_program() {
+        let envelope = actor_package();
+        let valid = declared(&envelope, 0, 64 * 1024);
+        for invalid in [
+            // Not the program's own length.
+            ActorResources {
+                program_bytes: valid.program_bytes + 1,
+                ..valid
+            },
+            ActorResources {
+                program_bytes: 0,
+                ..valid
+            },
+            // Heap is whole pages, within the standard header's u16 pages.
+            ActorResources {
+                heap_bytes: 4097,
+                ..valid
+            },
+            ActorResources {
+                heap_bytes: ActorResources::MAX_HEAP_BYTES + ActorResources::PAGE_BYTES,
+                ..valid
+            },
+            ActorResources {
+                stack_bytes: ActorResources::MAX_STACK_BYTES + 1,
+                ..valid
+            },
+        ] {
+            let mut changed = envelope.clone();
+            let PackageManifest::Actor(manifest) = &mut changed.manifest else {
+                unreachable!()
+            };
+            manifest.resources = Some(invalid);
+            assert!(changed.encode().is_err(), "{invalid:?}");
+            assert!(PackageEnvelope::decode(&encode_unchecked(&changed)).is_err());
+        }
+        assert!(
+            !ActorResources {
+                program_bytes: crate::MAX_RUNTIME_PROGRAM_BYTES as u32 + 1,
+                ..valid
+            }
+            .is_valid()
+        );
+        assert!(
+            ActorResources {
+                program_bytes: crate::MAX_RUNTIME_PROGRAM_BYTES as u32,
+                ..valid
+            }
+            .is_valid()
+        );
+        assert!(crate::STANDARD_ACTOR_PROGRAM_BYTES < crate::MAX_RUNTIME_PROGRAM_BYTES);
     }
 
     #[cfg(not(feature = "experimental-state-blocks"))]

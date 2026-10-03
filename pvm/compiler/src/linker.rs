@@ -70,6 +70,9 @@ struct LinkedElf {
     rw_min: u64,
     /// Stack size in bytes (= ro_base, so RO data is at the right PVM address)
     stack_size: u32,
+    /// Value of a `__vos_stack_size` symbol, when the guest declares its
+    /// standard-program stack explicitly (see [`spi_stack_size`]).
+    declared_stack_size: Option<u64>,
     /// Heap pages
     heap_pages: u32,
     /// PCREL_HI20: AUIPC instruction vaddr → resolved data address.
@@ -125,6 +128,8 @@ struct TranspiledElf {
     rw_min: u64,
     /// Stack byte capacity (= the page-floored lowest ro vaddr, min 16 KiB).
     stack_size: u32,
+    /// The guest's explicit standard-program stack, if it declares one.
+    declared_stack_size: Option<u64>,
     /// Zeroed heap pages beyond `rw_data`.
     heap_pages: u32,
 }
@@ -185,6 +190,8 @@ fn zone_round(x: u64) -> u64 {
 ///   `φ1 = s`, while `StandardProgram::layout` maps `page_round(s)` bytes
 ///   just below the argument zone with `φ1 = 0xFEFE_0000`. `φ1` is
 ///   host-installed in both, so SP-relative guest code is placement-blind.
+///   A guest that defines `__vos_stack_size` sets `s` directly instead, and
+///   only in this container ([`spi_stack_size`]).
 /// - **`z` (heap pages, `E₂`)** includes the manifest's explicit heap and
 ///   every trailing all-zero read-write page (normally `.bss`). Standard
 ///   programs distinguish initialized bytes from zero pages directly, so
@@ -268,12 +275,7 @@ pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
             )));
         }
     }
-    if t.stack_size >= 1 << 24 {
-        return Err(TranspileError::InvalidSection(format!(
-            "SPI: stack size {:#x} exceeds the E3 field width",
-            t.stack_size,
-        )));
-    }
+    let stack_size = spi_stack_size(t.stack_size, t.declared_stack_size)?;
     let heap_pages = u16::try_from(heap_pages).map_err(|_| {
         TranspileError::InvalidSection(format!(
             "SPI: heap page count {heap_pages} exceeds the E2 field width",
@@ -284,7 +286,7 @@ pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
         &ro_data,
         &rw_data,
         heap_pages,
-        t.stack_size,
+        stack_size,
         &t.code,
         &t.bitmask,
         &t.jump_table,
@@ -302,6 +304,38 @@ pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
     })?;
 
     Ok(blob)
+}
+
+/// Linker-script symbol whose value is a guest's standard-program stack size.
+pub const SPI_STACK_SIZE_SYMBOL: &str = "__vos_stack_size";
+
+/// The standard program's stack size `s`.
+///
+/// Without a declaration it is the page-floored lowest read-only address, as
+/// it has always been: the linker script's read-only base doubles as the
+/// stack size, which forces zero padding into the read-only blob whenever an
+/// actor needs more than the scaffold's 64 KiB. A guest may instead declare
+/// `__vos_stack_size` (whole pages, below the `E3` field width) and link its
+/// read-only data at the standard base with no padding. Either way the value
+/// is in the program's header, so it is part of the ProgramId.
+fn spi_stack_size(layout_derived: u32, declared: Option<u64>) -> Result<u32, TranspileError> {
+    let stack_size = match declared {
+        None => u64::from(layout_derived),
+        Some(declared) => {
+            if declared == 0 || declared % vos_pvm::PVM_PAGE_SIZE as u64 != 0 {
+                return Err(TranspileError::InvalidSection(format!(
+                    "SPI: {SPI_STACK_SIZE_SYMBOL} {declared:#x} is not a nonzero whole number of pages",
+                )));
+            }
+            declared
+        }
+    };
+    if stack_size >= 1 << 24 {
+        return Err(TranspileError::InvalidSection(format!(
+            "SPI: stack size {stack_size:#x} exceeds the E3 field width",
+        )));
+    }
+    Ok(stack_size as u32)
 }
 
 /// The shared ELF → GP-encoded-program translation both containers build on.
@@ -388,6 +422,7 @@ fn transpile_elf(
         rw_base: elf.rw_base,
         rw_min: elf.rw_min,
         stack_size: elf.stack_size,
+        declared_stack_size: elf.declared_stack_size,
         heap_pages: elf.heap_pages,
     })
 }
@@ -561,6 +596,12 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
     let accumulate_vaddr = symbols_by_idx
         .iter()
         .find(|(name, value)| name == "accumulate" && *value != 0)
+        .map(|(_, value)| *value);
+    // An explicit standard-program stack, from the guest's linker script
+    // (`__vos_stack_size = 0x40000;`). Absent in every existing guest.
+    let declared_stack_size = symbols_by_idx
+        .iter()
+        .find(|(name, _)| name == SPI_STACK_SIZE_SYMBOL)
         .map(|(_, value)| *value);
 
     // Compute PVM memory layout
@@ -866,6 +907,7 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
         rw_base,
         rw_min,
         stack_size: stack_size as u32,
+        declared_stack_size,
         heap_pages,
         hi20_targets,
         lo12_targets,
@@ -1265,6 +1307,22 @@ mod tests {
     use vos_pvm::{ExitReason, refine};
 
     #[test]
+    fn declared_stack_size_replaces_the_layout_derived_stack() {
+        // No declaration: the read-only base, exactly as before.
+        assert_eq!(spi_stack_size(0x1_0000, None).unwrap(), 0x1_0000);
+        assert!(spi_stack_size(1 << 24, None).is_err());
+        // A declared stack is independent of where read-only data is linked.
+        assert_eq!(spi_stack_size(0x1_0000, Some(0x4_0000)).unwrap(), 0x4_0000);
+        assert_eq!(spi_stack_size(0x4_0000, Some(0x1000)).unwrap(), 0x1000);
+        for invalid in [0, 0x1001, 1 << 24] {
+            assert!(
+                spi_stack_size(0x1_0000, Some(invalid)).is_err(),
+                "{invalid:#x}"
+            );
+        }
+    }
+
+    #[test]
     fn relocation_interval_index_matches_byte_overlap() {
         let original = vec![(20, 24), (4, 8), (6, 14), (24, 28), (4, 8), (40, 48)];
         let merged = merge_relocation_ranges(original.clone());
@@ -1391,6 +1449,7 @@ mod tests {
             rw_base: 0x2_0000,
             rw_min: 0x2_0000,
             stack_size: 0x1_0000,
+            declared_stack_size: None,
             heap_pages: 0,
             hi20_targets: HashMap::new(),
             lo12_targets: HashMap::new(),

@@ -21,6 +21,27 @@ pub struct InstallLocalArgs {
     pub http: Option<std::net::SocketAddr>,
     #[arg(long)]
     pub resume: bool,
+    /// The Agent owner's ceiling for this actor's program, in bytes. Above
+    /// the standard actor profile a package must also declare its resources;
+    /// the runtime never executes more than its hard maximum.
+    #[arg(long, default_value_t = vos::agent::sdk::STANDARD_ACTOR_PROGRAM_BYTES as u32)]
+    pub max_program_bytes: u32,
+}
+
+/// The owner's admission ceilings for a new Install.
+fn install_ceilings(
+    args: &InstallLocalArgs,
+) -> anyhow::Result<vos::agent::package_admission::ActorResourceCeilings> {
+    let ceilings = vos::agent::package_admission::ActorResourceCeilings {
+        max_program_bytes: args.max_program_bytes,
+        ..vos::agent::package_admission::ActorResourceCeilings::standard()
+    };
+    anyhow::ensure!(
+        ceilings.is_valid(),
+        "--max-program-bytes must be between 1 and the runtime maximum of {} B",
+        vos::agent::sdk::MAX_RUNTIME_PROGRAM_BYTES
+    );
+    Ok(ceilings)
 }
 
 pub(crate) fn run_install(args: InstallLocalArgs) -> anyhow::Result<()> {
@@ -123,11 +144,16 @@ fn install_local(
                 status == CredentialReservationStatus::Pending,
                 "completed Install is missing its retained request"
             );
-            let package = vos::agent::package_admission::admit_actor_package(&read_bounded(
-                &args.package,
-                vos::agent::sdk::package::MAX_PACKAGE_ENCODED_BYTES,
-            )?)
-            .map_err(|error| anyhow::anyhow!("invalid actor package: {error:?}"))?;
+            // A new Install is where the owner's ceilings apply; the retained
+            // request is later re-admitted on its bytes alone.
+            let package = vos::agent::package_admission::admit_actor_package_within(
+                &read_bounded(
+                    &args.package,
+                    vos::agent::sdk::package::MAX_PACKAGE_ENCODED_BYTES,
+                )?,
+                install_ceilings(args)?,
+            )
+            .map_err(|error| anyhow::anyhow!("invalid actor package: {error}"))?;
             let constructor = args
                 .constructor_data
                 .as_ref()
@@ -821,6 +847,7 @@ mod tests {
             constructor_data: Some(ctor),
             http: Some(address),
             resume,
+            max_program_bytes: vos::agent::sdk::STANDARD_ACTOR_PROGRAM_BYTES as u32,
         };
         let mut completed = None;
         for attempt in 0..4 {
@@ -941,6 +968,7 @@ mod tests {
             constructor_data: Some(directory.join("missing-constructor")),
             http: None,
             resume: true,
+            max_program_bytes: vos::agent::sdk::STANDARD_ACTOR_PROGRAM_BYTES as u32,
         };
         let address = "127.0.0.1:1".parse().unwrap();
         assert!(

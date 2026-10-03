@@ -32,10 +32,13 @@ pub const MAX_EXECUTION_STATE_TOTAL_BYTES: usize = 48 * 1024;
 /// Maximum aggregate content-addressed availability supplied to one call.
 pub const MAX_EXECUTION_AVAILABILITY_BYTES: usize =
     crate::agent_sdk::MAX_RUNTIME_CALLER_AVAILABILITY_BYTES;
-/// Maximum application PVM accepted by the bundled runtime. Parsing a PVM
+/// Maximum application PVM accepted by the bundled runtime: the hard maximum
+/// a declared actor may reach ([`crate::agent_sdk::MAX_RUNTIME_PROGRAM_BYTES`];
+/// undeclared actors are admitted for install only up to
+/// [`crate::agent_sdk::STANDARD_ACTOR_PROGRAM_BYTES`]). Parsing a PVM
 /// materializes its data, code, bitmask, and compact-code form concurrently,
 /// so this is intentionally much smaller than a generic service wire.
-pub const MAX_EXECUTION_PROGRAM_BYTES: usize = 1280 * 1024;
+pub const MAX_EXECUTION_PROGRAM_BYTES: usize = crate::agent_sdk::MAX_RUNTIME_PROGRAM_BYTES;
 /// Maximum instruction gas which an untrusted caller may assign to one actor
 /// invocation. The host adds its separately configured runtime-management
 /// budget around this value; actor-selected gas itself is never unbounded.

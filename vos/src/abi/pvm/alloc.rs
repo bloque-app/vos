@@ -1,17 +1,27 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 
-/// Guest heap arena. Application actors retain the compact 256 KiB profile.
-/// Infrastructure guests opt into a larger arena because one invocation may
-/// decode and re-encode a complete durable state transition. Both arenas are
-/// zero-initialized static data (`.bss`), so their size affects the declared
-/// memory/gas budget rather than the PVM artifact bytes.
+/// Guest heap arena. Application actors retain the compact 256 KiB profile
+/// unless they select a larger one (`actor-heap-*` features; the largest
+/// selected wins). Infrastructure guests opt into a larger arena because one
+/// invocation may decode and re-encode a complete durable state transition.
+/// Every arena is zero-initialized static data (`.bss`), so its size affects
+/// the program's declared heap pages and memory/gas budget rather than the
+/// PVM artifact bytes.
 #[cfg(feature = "agent-runtime")]
 const HEAP_SIZE: usize = 32 * 1024 * 1024;
 #[cfg(all(feature = "service-runtime", not(feature = "agent-runtime")))]
 const HEAP_SIZE: usize = 8 * 1024 * 1024;
 #[cfg(not(any(feature = "service-runtime", feature = "agent-runtime")))]
-const HEAP_SIZE: usize = 256 * 1024;
+const HEAP_SIZE: usize = if cfg!(feature = "actor-heap-16m") {
+    16 * 1024 * 1024
+} else if cfg!(feature = "actor-heap-4m") {
+    4 * 1024 * 1024
+} else if cfg!(feature = "actor-heap-1m") {
+    1024 * 1024
+} else {
+    256 * 1024
+};
 
 /// Minimum block size: must fit a `FreeNode` (2 × usize = 16 bytes on rv64).
 const MIN_BLOCK: usize = core::mem::size_of::<FreeNode>();
