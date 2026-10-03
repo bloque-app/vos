@@ -24,6 +24,7 @@ def run(asm, h, m, t, last):
         elif op=='ld': R[args[0]]=ld(mo(args[1]))
         elif op=='neg': R[args[0]]=(-R[args[1]])&M64
         elif op=='lla': R[args[0]]=IVB
+        elif op in ('.pushsection','.popsection'): continue
         elif op=='xor': R[args[0]]=R[args[1]]^R[args[2]]
         elif op=='add': R[args[0]]=(R[args[1]]+R[args[2]])&M64
         elif op=='or': R[args[0]]=R[args[1]]|R[args[2]]

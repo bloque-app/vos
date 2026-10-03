@@ -54,11 +54,9 @@ def main():
     G = gs()
     asm = []
     e = asm.append
-    name = "vos_protocol_blake2b_compress"
-    e(f".section .text.{name},\"ax\",@progbits")
-    e(f".global {name}")
-    e(f".type {name}, @function")
-    e(f"{name}:")
+    # The body of a naked Rust function (`vos_protocol::blake2b`): the symbol is Rust's, so two
+    # copies of the crate in one LTO module never define the same label; the IV table is a numeric
+    # local label in .rodata.
     # a0 = h (8 x u64, in/out), a1 = m (128 bytes, any alignment), a2 = t, a3 = last (0/1)
     e(f"addi sp, sp, -{FRAME}")
     for reg in ("ra", "s0", "s1"):
@@ -69,7 +67,7 @@ def main():
     e(f"sd a3, {SAVE['f']}(sp)")
     # Initial values: v[0..8] from h, v[8..16] from the IV table, with t and f folded in.
     # They are materialised into the stack frame first (one pass), then the cache starts empty.
-    e(f"lla {TMP}, vos_protocol_blake2b_iv")
+    e(f"lla {TMP}, 1f")
     for i in range(8):
         e(f"ld {CACHE[i % 4]}, {8 * i}(a0)")
         e(f"sd {CACHE[i % 4]}, {V_OFF(i)}(sp)")
@@ -146,13 +144,13 @@ def main():
         e(f"ld {reg}, {SAVE[reg]}(sp)")
     e(f"addi sp, sp, {FRAME}")
     e("ret")
-    e(f".size {name}, .-{name}")
-    e(".section .rodata.vos_protocol_blake2b_iv,\"a\",@progbits")
+    e(".pushsection .rodata,\"a\",@progbits")
     e(".p2align 3")
-    e("vos_protocol_blake2b_iv:")
+    e("1:")
     for v in [0x6A09E667F3BCC908, 0xBB67AE8584CAA73B, 0x3C6EF372FE94F82B, 0xA54FF53A5F1D36F1,
               0x510E527FADE682D1, 0x9B05688C2B3E6C1F, 0x1F83D9ABFB41BD6B, 0x5BE0CD19137E2179]:
         e(f".dword {hex(v)}")
+    e(".popsection")
     print("\n".join(asm))
 
 

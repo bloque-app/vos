@@ -1,7 +1,3 @@
-.section .text.vos_protocol_blake2b_compress,"ax",@progbits
-.global vos_protocol_blake2b_compress
-.type vos_protocol_blake2b_compress, @function
-vos_protocol_blake2b_compress:
 addi sp, sp, -176
 sd ra, 128(sp)
 sd s0, 136(sp)
@@ -10,7 +6,7 @@ sd a0, 152(sp)
 sd a2, 160(sp)
 neg a3, a3
 sd a3, 168(sp)
-lla a5, vos_protocol_blake2b_iv
+lla a5, 1f
 ld ra, 0(a0)
 sd ra, 0(sp)
 ld t0, 8(a0)
@@ -2711,10 +2707,9 @@ ld s0, 136(sp)
 ld s1, 144(sp)
 addi sp, sp, 176
 ret
-.size vos_protocol_blake2b_compress, .-vos_protocol_blake2b_compress
-.section .rodata.vos_protocol_blake2b_iv,"a",@progbits
+.pushsection .rodata,"a",@progbits
 .p2align 3
-vos_protocol_blake2b_iv:
+1:
 .dword 0x6a09e667f3bcc908
 .dword 0xbb67ae8584caa73b
 .dword 0x3c6ef372fe94f82b
@@ -2723,3 +2718,4 @@ vos_protocol_blake2b_iv:
 .dword 0x9b05688c2b3e6c1f
 .dword 0x1f83d9abfb41bd6b
 .dword 0x5be0cd19137e2179
+.popsection

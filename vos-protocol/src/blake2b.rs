@@ -28,12 +28,12 @@ const IV: [u64; 8] = [
     0x5BE0CD19137E2179,
 ];
 
+/// The scheduled compression (`blake2b_rv64em.S`): a naked function, so its symbol is
+/// Rust's own and two copies of this crate in one LTO module never collide.
 #[cfg(all(target_arch = "riscv64", not(feature = "outer-blake2b-precompile")))]
-core::arch::global_asm!(include_str!("blake2b_rv64em.S"));
-
-#[cfg(all(target_arch = "riscv64", not(feature = "outer-blake2b-precompile")))]
-unsafe extern "C" {
-    fn vos_protocol_blake2b_compress(h: *mut u64, m: *const u8, t: u64, last: u64);
+#[unsafe(naked)]
+unsafe extern "C" fn vos_protocol_blake2b_compress(h: *mut u64, m: *const u8, t: u64, last: u64) {
+    core::arch::naked_asm!(include_str!("blake2b_rv64em.S"))
 }
 
 /// One BLAKE2b compression of the 128 bytes at `block` into `h`, with byte counter `t`
