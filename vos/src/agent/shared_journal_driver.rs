@@ -6953,6 +6953,7 @@ fn clean_management_artifact_references(operation: &ReplayOperation) -> Option<V
         | crate::agent_sdk::ManagementRequest::Resume { .. }
         | crate::agent_sdk::ManagementRequest::RemoveLeaf { .. }
         | crate::agent_sdk::ManagementRequest::ChangeReplicas { .. }
+        | crate::agent_sdk::ManagementRequest::SetExecutionLimits(_)
         | crate::agent_sdk::ManagementRequest::PrivateControl { .. } => Vec::new(),
     };
     artifacts.sort_by_key(|artifact| artifact.hash);

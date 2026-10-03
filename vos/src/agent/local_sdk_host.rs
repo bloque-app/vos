@@ -2209,6 +2209,9 @@ mod tests {
             ManagementRequest::ChangeReplicas { .. } => {
                 (AuthorityOperationKind::ChangeReplicaSet, None, None)
             }
+            ManagementRequest::SetExecutionLimits(_) => {
+                (AuthorityOperationKind::SetExecutionLimits, None, None)
+            }
             ManagementRequest::InspectActors { .. }
             | ManagementRequest::InspectResources
             | ManagementRequest::InspectManagementHistory => {
