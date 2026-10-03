@@ -75,6 +75,25 @@ pub(super) fn resolve_local_space(
     Ok((data.to_path_buf(), space, public, address))
 }
 
+/// Create an operator-owned ordinary Shared Agent whose single voter is this
+/// node. Shares Local Create's credential lease and exact-retry discipline.
+pub(crate) fn run_create_shared(
+    query: &str,
+    http: Option<std::net::SocketAddr>,
+    resume: bool,
+) -> anyhow::Result<()> {
+    let (data, space, public, address) = resolve_local_space(query, http)?;
+    let operator = crate::identity::load_existing()?;
+    let ack = create_agent(&data, address, &operator, space, public, resume, true)?;
+    let agent = hex::encode(ack.managed.agent.0);
+    if crate::output::is_json() {
+        print_acknowledgement(&ack)
+    } else {
+        println!("Shared Agent {agent}: verified creation acknowledgement");
+        Ok(())
+    }
+}
+
 /// The credential lease spans every phase. Existing request bytes always take
 /// precedence over discovery and preparation when explicitly resuming.
 pub(crate) fn create_local(
@@ -84,6 +103,18 @@ pub(crate) fn create_local(
     space: vos::agent::sdk::SpaceId,
     node_public: [u8; 32],
     resume: bool,
+) -> anyhow::Result<vos::agent::sdk::authority::ManagementApplicationAck> {
+    create_agent(data, address, operator, space, node_public, resume, false)
+}
+
+fn create_agent(
+    data: &std::path::Path,
+    address: std::net::SocketAddr,
+    operator: &Keypair,
+    space: vos::agent::sdk::SpaceId,
+    node_public: [u8; 32],
+    resume: bool,
+    shared: bool,
 ) -> anyhow::Result<vos::agent::sdk::authority::ManagementApplicationAck> {
     use super::clean_store::{
         CleanCredentialReservation, CleanLocalCreateRequestFile, CredentialReservationStatus,
@@ -158,16 +189,29 @@ pub(crate) fn create_local(
             let expires = now
                 .checked_add(3600)
                 .ok_or_else(|| anyhow::anyhow!("validity window overflow"))?;
-            let bytes = prepare_fresh(
-                operator,
-                space,
-                node_public,
-                nonce,
-                sequence,
-                now.saturating_sub(60),
-                expires,
-            )?
-            .encode();
+            let bytes = if shared {
+                prepare_fresh_shared(
+                    operator,
+                    space,
+                    node_public,
+                    nonce,
+                    sequence,
+                    now.saturating_sub(60),
+                    expires,
+                )?
+                .encode()
+            } else {
+                prepare_fresh(
+                    operator,
+                    space,
+                    node_public,
+                    nonce,
+                    sequence,
+                    now.saturating_sub(60),
+                    expires,
+                )?
+                .encode()
+            };
             store.publish(&bytes)?;
             bytes
         }
@@ -176,6 +220,11 @@ pub(crate) fn create_local(
         elapsed_ms = started.elapsed().as_millis() as u64,
         retained_bytes = bytes.len(),
         "Local Create request ready",
+    );
+    anyhow::ensure!(
+        bytes.starts_with(if shared { b"SCQ1" } else { b"LCQ1" }),
+        "retained Create {} has a different Agent profile; resume it with its original command",
+        hex::encode(nonce.0)
     );
     let (descriptor, call) = decode_retained_request(&bytes)?;
     anyhow::ensure!(
@@ -570,9 +619,86 @@ pub(crate) fn prepare_fresh(
     valid_from: u64,
     expires_at: u64,
 ) -> anyhow::Result<LocalCreateSubmission> {
-    use vos::agent::sdk::{
-        AgentId, AgentIdentity, AgentProfile, AgentReplica, ProducerId, ReplicaRole,
-    };
+    let (authority, descriptor, runtime) = fresh_descriptor(
+        operator,
+        space,
+        node_public,
+        nonce,
+        vos::agent::sdk::AgentProfile::Local,
+    )?;
+    prepare(
+        operator, authority, descriptor, runtime, sequence, valid_from, expires_at,
+    )
+}
+
+/// Ordinary Shared Create whose single voter is this node, identified by its
+/// advertised transport key. Endorsement and publication remain daemon-side.
+pub(crate) fn prepare_fresh_shared(
+    operator: &Keypair,
+    space: vos::agent::sdk::SpaceId,
+    node_public: [u8; 32],
+    nonce: vos::agent::sdk::Hash,
+    sequence: NonZeroU64,
+    valid_from: u64,
+    expires_at: u64,
+) -> anyhow::Result<vos::agent::local_lifecycle::SharedCreateSubmission> {
+    use vos::agent::genesis::{AgentReplicaCommittee, AgentReplicaMember};
+    let (authority, descriptor, runtime) = fresh_descriptor(
+        operator,
+        space,
+        node_public,
+        nonce,
+        vos::agent::sdk::AgentProfile::Shared,
+    )?;
+    let node_key = libp2p::identity::ed25519::PublicKey::try_from_bytes(&node_public)
+        .map_err(|_| anyhow::anyhow!("invalid node public key"))?;
+    let peer = libp2p::identity::PublicKey::from(node_key)
+        .to_peer_id()
+        .to_bytes();
+    let replica = &descriptor.replicas[0];
+    let replicas = AgentReplicaCommittee::new(
+        vos::service::SpaceId(space.0),
+        vos::service::AgentId(descriptor.identity.agent.0),
+        vos::agent::AgentProfile::Shared,
+        vec![
+            AgentReplicaMember::new(
+                vos::agent::AgentReplica {
+                    node: vos::service::NodeId(replica.node.0),
+                    principal: vos::service::PrincipalId(replica.principal.0),
+                    role: vos::agent::ReplicaRole::Voter,
+                },
+                peer.clone(),
+                node_public,
+                Some(vos::agent::genesis::derive_replica_raft_slot(&peer)),
+            )
+            .map_err(|error| anyhow::anyhow!("invalid replica member: {error:?}"))?,
+        ],
+    )
+    .map_err(|error| anyhow::anyhow!("invalid replica committee: {error:?}"))?;
+    let call = sign_create_call(
+        operator,
+        authority,
+        &descriptor,
+        sequence,
+        valid_from,
+        expires_at,
+    )?;
+    vos::agent::local_lifecycle::SharedCreateSubmission::new(descriptor, call, runtime, replicas)
+        .map_err(|error| anyhow::anyhow!("invalid signed Shared Create: {error:?}"))
+}
+
+fn fresh_descriptor(
+    operator: &Keypair,
+    space: vos::agent::sdk::SpaceId,
+    node_public: [u8; 32],
+    nonce: vos::agent::sdk::Hash,
+    profile: vos::agent::sdk::AgentProfile,
+) -> anyhow::Result<(
+    AuthorityActorTarget,
+    AgentDescriptor,
+    AdmittedRuntimePackage,
+)> {
+    use vos::agent::sdk::{AgentId, AgentIdentity, AgentReplica, ProducerId, ReplicaRole};
     let signer = CleanOperatorIdentitySigner::new(operator)?;
     anyhow::ensure!(
         node_public != signer.raw_public_key(),
@@ -598,7 +724,7 @@ pub(crate) fn prepare_fresh(
             space,
             agent: AgentId::derive(space, signer.principal(), nonce.as_bytes()),
             owner: signer.principal(),
-            profile: AgentProfile::Local,
+            profile,
             runtime_deployment: runtime.deployment(),
             runtime_program: runtime.program(),
             runtime_producer: runtime.producer(),
@@ -616,9 +742,7 @@ pub(crate) fn prepare_fresh(
             role: ReplicaRole::Voter,
         }],
     };
-    prepare(
-        operator, authority, descriptor, runtime, sequence, valid_from, expires_at,
-    )
+    Ok((authority, descriptor, runtime))
 }
 
 /// Submit an already persisted request to a local daemon. No signing or
@@ -650,14 +774,19 @@ fn submit_retained_disposition(
     let bytes = store
         .load()?
         .ok_or_else(|| anyhow::anyhow!("no retained Local Create request"))?;
+    let shared = bytes.starts_with(b"SCQ1");
     let result = (|| -> anyhow::Result<_> {
         let (status, reply) = post_binary_response(
             address,
-            "/__agents/local",
+            if shared {
+                "/__agents/shared"
+            } else {
+                "/__agents/local"
+            },
             201,
             &bytes,
             MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES,
-            Some(vos::agent::local_lifecycle::LocalCreateDenial::MAX_BYTES),
+            (!shared).then_some(vos::agent::local_lifecycle::LocalCreateDenial::MAX_BYTES),
             None,
         )?;
         if status == 403 {
@@ -717,6 +846,13 @@ pub(crate) fn decode_retained_request(
             let (descriptor, call, _) = LocalCreateSubmission::decode(request)
                 .map_err(|error| anyhow::anyhow!("invalid retained LCQ1: {error:?}"))?
                 .into_parts();
+            Ok((descriptor, call))
+        }
+        Some(b"SCQ1") => {
+            let (descriptor, call, _, _) =
+                vos::agent::local_lifecycle::SharedCreateSubmission::decode(request)
+                    .map_err(|error| anyhow::anyhow!("invalid retained SCQ1: {error:?}"))?
+                    .into_parts();
             Ok((descriptor, call))
         }
         Some(b"LCQ2") => anyhow::bail!(

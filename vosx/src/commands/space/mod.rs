@@ -2,7 +2,9 @@
 //!
 //! Clean-generation administration includes fresh Local Create and exact
 //! retained-request retries, Local Install, and managed Local invocation.
-//! Ordinary Shared-Agent provisioning remains unwired.
+//! Ordinary Shared Agents can be created with this node as their single voter,
+//! installed into and invoked through the same paths. Joining further replicas
+//! to an existing Shared Agent remains unwired.
 
 use clap::Subcommand;
 use std::path::PathBuf;
@@ -142,6 +144,20 @@ pub enum SpaceCommand {
         #[arg(long)]
         resume: bool,
     },
+    /// Create an operator-owned ordinary Shared Agent with this node as its voter.
+    #[cfg(target_os = "linux")]
+    CreateSharedAgent {
+        space: String,
+        /// Override the configured local plaintext HTTP endpoint.
+        #[arg(long)]
+        http: Option<std::net::SocketAddr>,
+        /// Resume the latest retained operation without changing signed bytes.
+        #[arg(long)]
+        resume: bool,
+    },
+    /// Install a signed actor package into an operator-owned Shared Agent.
+    #[cfg(target_os = "linux")]
+    InstallSharedActor(local_install::InstallLocalArgs),
     /// Submit or retry an already retained signed Local Create request.
     #[cfg(target_os = "linux")]
     SubmitLocalCreate {
@@ -261,6 +277,14 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             http,
             resume,
         } => local_create::run_create(&space, http, resume),
+        #[cfg(target_os = "linux")]
+        SpaceCommand::CreateSharedAgent {
+            space,
+            http,
+            resume,
+        } => local_create::run_create_shared(&space, http, resume),
+        #[cfg(target_os = "linux")]
+        SpaceCommand::InstallSharedActor(args) => local_install::run_install_shared(args),
         #[cfg(target_os = "linux")]
         SpaceCommand::SubmitLocalInstall { request_dir, http } => {
             local_install::run_submit(&request_dir, http)

@@ -327,6 +327,12 @@ fn dispatch(owner: &mut AgentProductionOwner, request: PendingLocalLifecycle) {
             let (install, call, package) = submission.into_parts();
             let _ = reply.try_send(owner.install_local_actor(install, call, package));
         }
+        PendingLocalLifecycle::CreateShared { submission, reply } => {
+            let _ = reply.try_send(owner.create_shared_agent(submission));
+        }
+        PendingLocalLifecycle::InstallShared { submission, reply } => {
+            let _ = reply.try_send(owner.install_shared_actor(submission));
+        }
     }
 }
 

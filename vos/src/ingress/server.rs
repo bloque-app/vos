@@ -309,6 +309,14 @@ async fn handle_request(
                 return handle_local_install(&request, &handle);
             }
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            if request.uri().path() == "/__agents/shared" {
+                return handle_shared_create(&request, &handle);
+            }
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            if request.uri().path() == "/__agents/shared/install" {
+                return handle_shared_install(&request, &handle);
+            }
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             if request.uri().path() == "/__agents/authorize" {
                 return handle_operation_authorization(&request, &handle);
             }
@@ -721,6 +729,163 @@ fn handle_local_install(
         Err(_) => text(
             504,
             "Local Install outcome unknown; retry the identical signed submission",
+        ),
+    }
+}
+
+#[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+fn shared_lifecycle_request_error(
+    request: &super::types::Request,
+    maximum: usize,
+    label: &'static str,
+) -> Option<super::types::Response> {
+    use super::types::text;
+    if request.body().len() > maximum {
+        return Some(text(413, "request body too large"));
+    }
+    if request.method() != http::Method::POST {
+        return Some(text(405, label));
+    }
+    if request.uri().query().is_some() {
+        return Some(text(
+            400,
+            "Shared lifecycle does not accept query parameters",
+        ));
+    }
+    if request
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/octet-stream")
+    {
+        return Some(text(
+            415,
+            "Shared lifecycle requires application/octet-stream",
+        ));
+    }
+    None
+}
+
+/// Exact signed ordinary Shared Create (SCQ1). The daemon endorses only with
+/// its configured root credential; publication, finality and route exposure
+/// remain owner-verified. HTTP cannot attest a transport/node binding.
+#[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+fn handle_shared_create(
+    request: &super::types::Request,
+    handle: &IngressHandle,
+) -> super::types::Response {
+    use super::types::{text, with_content_type};
+    use crate::agent::local_lifecycle::{LocalLifecycleIngressError, SharedCreateSubmission};
+    use crate::agent::sdk::wire::CanonicalWire as _;
+    if let Some(response) = shared_lifecycle_request_error(
+        request,
+        SharedCreateSubmission::MAX_BYTES,
+        "Shared Create is POST-only",
+    ) {
+        return response;
+    }
+    let submission = match SharedCreateSubmission::decode(request.body()) {
+        Ok(value) => value,
+        Err(_) => return text(400, "invalid signed Shared Create submission"),
+    };
+    if submission.call().authenticated_node.is_some() {
+        return text(
+            403,
+            "HTTP Shared Create does not accept transport-node claims",
+        );
+    }
+    let reply = match handle.create_clean_shared_agent(submission) {
+        Ok(reply) => reply,
+        Err(LocalLifecycleIngressError::Invalid) => return text(400, "invalid Shared Create"),
+        Err(LocalLifecycleIngressError::Busy) => return text(503, "Local lifecycle queue is full"),
+        Err(LocalLifecycleIngressError::Unavailable) => {
+            return text(503, "Shared lifecycle unavailable");
+        }
+    };
+    match reply.recv_timeout(Duration::from_secs(120)) {
+        Ok(Ok(acknowledgement)) => match acknowledgement.encode() {
+            Ok(bytes) => with_content_type(201, "application/octet-stream", bytes),
+            Err(_) => text(500, "invalid lifecycle acknowledgement"),
+        },
+        Ok(Err(crate::agent::production_owner::AgentProductionOwnerError::Lifecycle(
+            crate::agent::shared_host::SharedAgentHostError::ScopeMismatch,
+        ))) => text(403, "Shared Create scope or authorization rejected"),
+        Ok(Err(error)) => {
+            crate::log::warn!("Shared Create did not complete: {error:?}");
+            local_lifecycle_failure(
+                error,
+                "Shared Create incomplete; retry the identical signed submission",
+            )
+        }
+        Err(_) => text(
+            504,
+            "Shared Create outcome unknown; retry the identical signed submission",
+        ),
+    }
+}
+
+/// Exact signed ordinary Shared Install (SIQ1). A 403 carries the signed
+/// denial certificate for this exact request; other refusals carry text.
+#[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+fn handle_shared_install(
+    request: &super::types::Request,
+    handle: &IngressHandle,
+) -> super::types::Response {
+    use super::types::{text, with_content_type};
+    use crate::agent::local_lifecycle::{
+        LocalLifecycleIngressError, SharedInstallDisposition, SharedInstallSubmission,
+    };
+    use crate::agent::sdk::wire::CanonicalWire as _;
+    if let Some(response) = shared_lifecycle_request_error(
+        request,
+        SharedInstallSubmission::MAX_BYTES,
+        "Shared Install is POST-only",
+    ) {
+        return response;
+    }
+    let submission = match SharedInstallSubmission::decode(request.body()) {
+        Ok(value) => value,
+        Err(_) => return text(400, "invalid signed Shared Install submission"),
+    };
+    if submission.call().authenticated_node.is_some() {
+        return text(
+            403,
+            "HTTP Shared Install does not accept transport-node claims",
+        );
+    }
+    let reply = match handle.install_clean_shared_actor(submission) {
+        Ok(reply) => reply,
+        Err(LocalLifecycleIngressError::Invalid) => return text(400, "invalid Shared Install"),
+        Err(LocalLifecycleIngressError::Busy) => return text(503, "Local lifecycle queue is full"),
+        Err(LocalLifecycleIngressError::Unavailable) => {
+            return text(503, "Shared lifecycle unavailable");
+        }
+    };
+    match reply.recv_timeout(Duration::from_secs(120)) {
+        Ok(Ok(SharedInstallDisposition::Installed(acknowledgement))) => {
+            match acknowledgement.encode() {
+                Ok(bytes) => with_content_type(201, "application/octet-stream", bytes),
+                Err(_) => text(500, "invalid lifecycle acknowledgement"),
+            }
+        }
+        Ok(Ok(SharedInstallDisposition::Denied(denial))) => with_content_type(
+            403,
+            "application/octet-stream",
+            denial.exact_bytes().to_vec(),
+        ),
+        Ok(Err(crate::agent::production_owner::AgentProductionOwnerError::Lifecycle(
+            crate::agent::shared_host::SharedAgentHostError::ScopeMismatch,
+        ))) => text(422, "Shared Install scope rejected or application refused"),
+        Ok(Err(error)) => {
+            crate::log::warn!("Shared Install did not complete: {error:?}");
+            local_lifecycle_failure(
+                error,
+                "Shared Install incomplete; retry the identical signed submission",
+            )
+        }
+        Err(_) => text(
+            504,
+            "Shared Install outcome unknown; retry the identical signed submission",
         ),
     }
 }

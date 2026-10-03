@@ -2416,6 +2416,40 @@ impl IngressHandle {
         self.clean_local_lifecycle_queue.submit_install(submission)
     }
 
+    /// Queue one exact signed ordinary Shared Create. Acceptance is not
+    /// authorization, endorsement or application; await the returned result.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn create_clean_shared_agent(
+        &self,
+        submission: crate::agent::local_lifecycle::SharedCreateSubmission,
+    ) -> Result<
+        mpsc::Receiver<crate::agent::local_lifecycle::SharedCreateResult>,
+        crate::agent::local_lifecycle::LocalLifecycleIngressError,
+    > {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(crate::agent::local_lifecycle::LocalLifecycleIngressError::Unavailable);
+        }
+        self.clean_local_lifecycle_queue
+            .submit_shared_create(submission)
+    }
+
+    /// Queue one exact signed ordinary Shared Install. Disconnection does not
+    /// cancel accepted durable work; retain the frame for an exact retry.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn install_clean_shared_actor(
+        &self,
+        submission: crate::agent::local_lifecycle::SharedInstallSubmission,
+    ) -> Result<
+        mpsc::Receiver<crate::agent::local_lifecycle::SharedInstallResult>,
+        crate::agent::local_lifecycle::LocalLifecycleIngressError,
+    > {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(crate::agent::local_lifecycle::LocalLifecycleIngressError::Unavailable);
+        }
+        self.clean_local_lifecycle_queue
+            .submit_shared_install(submission)
+    }
+
     /// Queue a signed call for durable native clock capture. Queue acceptance
     /// itself is not durable; the caller must retain the exact AOC5 for retry.
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
@@ -5922,6 +5956,50 @@ impl VosNode {
             .call(move |owner| {
                 owner.ok_or(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)?
                     .create_local_disposition(descriptor, call, runtime)
+            })?
+    }
+
+    /// Signed ordinary Shared Create through the retained lifecycle controller,
+    /// followed by authenticated route reconciliation. A failure after
+    /// application is retryable only with the same signed submission.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn create_clean_shared_agent(
+        &mut self,
+        submission: crate::agent::local_lifecycle::SharedCreateSubmission,
+    ) -> crate::agent::local_lifecycle::SharedCreateResult {
+        use crate::agent::production_owner::AgentProductionOwnerError;
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(AgentProductionOwnerError::InvalidConfiguration);
+        }
+        self.clean_agent_owner
+            .as_ref()
+            .ok_or(AgentProductionOwnerError::InvalidConfiguration)?
+            .call(move |owner| {
+                owner
+                    .ok_or(AgentProductionOwnerError::InvalidConfiguration)?
+                    .create_shared_agent(submission)
+            })?
+    }
+
+    /// Signed ordinary Shared Install through the retained lifecycle controller
+    /// and verified actor-route publication. Exact retries keep the original
+    /// signed terminal.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn install_clean_shared_actor(
+        &mut self,
+        submission: crate::agent::local_lifecycle::SharedInstallSubmission,
+    ) -> crate::agent::local_lifecycle::SharedInstallResult {
+        use crate::agent::production_owner::AgentProductionOwnerError;
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(AgentProductionOwnerError::InvalidConfiguration);
+        }
+        self.clean_agent_owner
+            .as_ref()
+            .ok_or(AgentProductionOwnerError::InvalidConfiguration)?
+            .call(move |owner| {
+                owner
+                    .ok_or(AgentProductionOwnerError::InvalidConfiguration)?
+                    .install_shared_actor(submission)
             })?
     }
 

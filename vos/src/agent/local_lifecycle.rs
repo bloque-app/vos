@@ -20,6 +20,9 @@ pub const LOCAL_LIFECYCLE_QUEUE_CAPACITY: usize = 4;
 #[path = "operation_submission.rs"]
 mod operation_submission;
 pub use operation_submission::AuthorityOperationSubmission;
+#[path = "shared_submission.rs"]
+mod shared_submission;
+pub use shared_submission::{SharedCreateSubmission, SharedInstallSubmission};
 
 pub type AuthorityOperationResult =
     Result<super::clean_bootstrap::NativeAuthorityOperationDecision, SharedAgentHostError>;
@@ -479,6 +482,20 @@ pub(crate) struct PendingLocalCreate {
 pub type LocalInstallResult =
     Result<ManagementApplicationAck, super::production_owner::AgentProductionOwnerError>;
 
+/// Terminal outcome of one exact ordinary Shared Install. A denial carries
+/// the signed certificate for the caller's retained request; it is not an
+/// application failure and installs nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SharedInstallDisposition {
+    Installed(ManagementApplicationAck),
+    Denied(SharedInstallDenial),
+}
+
+pub type SharedCreateResult =
+    Result<ManagementApplicationAck, super::production_owner::AgentProductionOwnerError>;
+pub type SharedInstallResult =
+    Result<SharedInstallDisposition, super::production_owner::AgentProductionOwnerError>;
+
 pub(crate) enum PendingLocalLifecycle {
     PrepareAdmin {
         draft: super::sdk::authority::AuthorityAdminCall,
@@ -511,6 +528,14 @@ pub(crate) enum PendingLocalLifecycle {
         submission: LocalInstallSubmission,
         reply: mpsc::SyncSender<LocalInstallResult>,
     },
+    CreateShared {
+        submission: SharedCreateSubmission,
+        reply: mpsc::SyncSender<SharedCreateResult>,
+    },
+    InstallShared {
+        submission: SharedInstallSubmission,
+        reply: mpsc::SyncSender<SharedInstallResult>,
+    },
 }
 
 impl PendingLocalLifecycle {
@@ -541,6 +566,12 @@ impl PendingLocalLifecycle {
                 let _ = reply.try_send(Err(error));
             }
             Self::Install { reply, .. } => {
+                let _ = reply.try_send(Err(error));
+            }
+            Self::CreateShared { reply, .. } => {
+                let _ = reply.try_send(Err(error));
+            }
+            Self::InstallShared { reply, .. } => {
                 let _ = reply.try_send(Err(error));
             }
         }
@@ -742,6 +773,24 @@ impl LocalLifecycleQueue {
                 mpsc::TrySendError::Full(_) => LocalLifecycleIngressError::Busy,
                 mpsc::TrySendError::Disconnected(_) => LocalLifecycleIngressError::Unavailable,
             })?;
+        Ok(receiver)
+    }
+
+    pub(crate) fn submit_shared_create(
+        &self,
+        submission: SharedCreateSubmission,
+    ) -> Result<mpsc::Receiver<SharedCreateResult>, LocalLifecycleIngressError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.enqueue_admin(PendingLocalLifecycle::CreateShared { submission, reply })?;
+        Ok(receiver)
+    }
+
+    pub(crate) fn submit_shared_install(
+        &self,
+        submission: SharedInstallSubmission,
+    ) -> Result<mpsc::Receiver<SharedInstallResult>, LocalLifecycleIngressError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.enqueue_admin(PendingLocalLifecycle::InstallShared { submission, reply })?;
         Ok(receiver)
     }
 
@@ -2096,6 +2145,47 @@ pub(crate) trait NativeLocalLifecycle: Send {
     ) -> Result<ManagementApplicationAck, SharedAgentHostError> {
         Err(SharedAgentHostError::Unavailable)
     }
+    fn create_shared(
+        &mut self,
+        _submission: SharedCreateSubmission,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
+    fn install_shared(
+        &mut self,
+        _submission: SharedInstallSubmission,
+    ) -> Result<SharedInstallDisposition, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
+}
+
+/// Signs one prepared ordinary Shared genesis candidate with credentials this
+/// node is configured to hold, retaining each signature durably before it is
+/// returned. Endorsement is not publication, finality or route permission;
+/// the owner still selects quorum evidence and verifies its publication.
+pub trait SharedGenesisEndorser: Send {
+    fn endorse(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        prepared: &super::clean_bootstrap::PreparedSharedGenesisEndorsement,
+    ) -> Result<Vec<super::committee::AuthoritySignature>, SharedAgentHostError>;
+}
+
+impl<F> SharedGenesisEndorser for F
+where
+    F: FnMut(
+            super::genesis::AgentGenesisLocator,
+            &super::clean_bootstrap::PreparedSharedGenesisEndorsement,
+        ) -> Result<Vec<super::committee::AuthoritySignature>, SharedAgentHostError>
+        + Send,
+{
+    fn endorse(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        prepared: &super::clean_bootstrap::PreparedSharedGenesisEndorsement,
+    ) -> Result<Vec<super::committee::AuthoritySignature>, SharedAgentHostError> {
+        self(locator, prepared)
+    }
 }
 
 // Image-only builds do not inherit a storage-format requirement from the
@@ -2283,6 +2373,20 @@ where
         runtime: AdmittedRuntimePackage,
     ) -> Result<(AgentId, ManagementApplicationAck), SharedAgentHostError> {
         LocalLifecycleController::create(self, descriptor, call, runtime)
+    }
+
+    fn create_shared(
+        &mut self,
+        submission: SharedCreateSubmission,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError> {
+        LocalLifecycleController::create_shared(self, submission)
+    }
+
+    fn install_shared(
+        &mut self,
+        submission: SharedInstallSubmission,
+    ) -> Result<SharedInstallDisposition, SharedAgentHostError> {
+        LocalLifecycleController::install_shared(self, submission)
     }
 
     #[cfg(all(
@@ -2821,6 +2925,7 @@ where
     operations: Option<Box<dyn NativeAuthorityOperationAccess<P, R, I>>>,
     admins: Option<Box<dyn NativeAuthorityAdminAccess<P, R, I>>>,
     shared_genesis: Option<Box<dyn NativeSharedGenesisAccess<P, R, I, S>>>,
+    shared_endorser: Option<Box<dyn SharedGenesisEndorser>>,
 }
 
 impl<P, R, I, F, S> LocalLifecycleController<P, R, I, F, S>
@@ -2849,6 +2954,7 @@ where
             operations: None,
             admins: None,
             shared_genesis: None,
+            shared_endorser: None,
         })
     }
 
@@ -2902,6 +3008,7 @@ where
             operations: None,
             admins: None,
             shared_genesis: None,
+            shared_endorser: None,
         };
         for entry in recovery.entries {
             if controller
@@ -3321,6 +3428,87 @@ where
             .as_mut()
             .ok_or(SharedAgentHostError::Conflict)?
             .install_denial(locator, install, call)
+    }
+
+    /// Retain the node's genesis endorser for the controller's lifetime. Only
+    /// `create_shared` consults it; recovery never signs a new endorsement.
+    pub fn with_shared_genesis_endorser(
+        mut self,
+        endorser: impl SharedGenesisEndorser + 'static,
+    ) -> Result<Self, SharedAgentHostError> {
+        if self.shared_endorser.is_some() {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        self.shared_endorser = Some(Box::new(endorser));
+        Ok(self)
+    }
+
+    /// Drive one exact signed ordinary Shared Create through reservation,
+    /// endorsement, publication, physical application, signed finality and
+    /// retirement. Each phase keeps its own exact-retry semantics, so a retry
+    /// after any failure (or restart) resumes rather than repeating work. The
+    /// returned ACK is the original signed application acknowledgement.
+    pub fn create_shared(
+        &mut self,
+        submission: SharedCreateSubmission,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError> {
+        let (descriptor, call, runtime, replicas) = submission.into_parts();
+        let locator = self.reserve_shared_create(&descriptor, &call, &runtime, &replicas)?;
+        match self.prepare_shared_create(locator) {
+            Ok(prepared) => {
+                let signatures = self
+                    .shared_endorser
+                    .as_mut()
+                    .ok_or(SharedAgentHostError::Unavailable)?
+                    .endorse(locator, &prepared)?;
+                self.publish_shared_create(locator, signatures)?;
+            }
+            // An archived or retired Create refuses fresh preparation. Its
+            // completion below is independently reauthenticated by the owner.
+            Err(SharedAgentHostError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        let acknowledgement = self.complete_shared_create(locator)?;
+        if acknowledgement.credential_call != call.commitment() {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        Ok(acknowledgement)
+    }
+
+    /// Drive one exact signed Install on a retained ordinary Shared Agent to
+    /// its signed terminal. A retained policy denial for this exact request is
+    /// returned as such; a signed application rejection is not an install.
+    pub fn install_shared(
+        &mut self,
+        submission: SharedInstallSubmission,
+    ) -> Result<SharedInstallDisposition, SharedAgentHostError> {
+        let (install, call, package) = submission.into_parts();
+        let locator = super::genesis::AgentGenesisLocator {
+            space: crate::service::SpaceId(call.managed.space.0),
+            agent: crate::service::AgentId(call.managed.agent.0),
+        };
+        if let Some(denial) = self.shared_install_denial(locator, &install, &call)? {
+            return Ok(SharedInstallDisposition::Denied(denial));
+        }
+        let terminal = self
+            .prepare_shared_install(install.clone(), call.clone(), &package)
+            .and_then(|()| self.complete_shared_install(locator));
+        match terminal {
+            Ok(SignedManagementTerminal::Applied(acknowledgement))
+                if acknowledgement.credential_call == call.commitment() =>
+            {
+                Ok(SharedInstallDisposition::Installed(acknowledgement))
+            }
+            Ok(SignedManagementTerminal::Applied(_)) => Err(SharedAgentHostError::Conflict),
+            Ok(SignedManagementTerminal::Rejected(_)) => Err(SharedAgentHostError::ScopeMismatch),
+            Err(SharedAgentHostError::ScopeMismatch) => {
+                match self.shared_install_denial(locator, &install, &call)? {
+                    Some(denial) => Ok(SharedInstallDisposition::Denied(denial)),
+                    None => Err(SharedAgentHostError::ScopeMismatch),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Adopt the recovered admin stores for the full production-owner lifetime.
@@ -3956,6 +4144,7 @@ where
             operations,
             admins,
             shared_genesis,
+            shared_endorser: _,
         } = self;
         assert!(
             shared_genesis.is_none(),
@@ -4017,6 +4206,7 @@ where
             operations,
             admins,
             shared_genesis,
+            shared_endorser: _,
         } = self;
         assert!(operations.is_none() && admins.is_none() && shared_genesis.is_none());
         drop(retained_stores);

@@ -36,6 +36,30 @@ pub(crate) fn run_install(args: InstallLocalArgs) -> anyhow::Result<()> {
     print_acknowledgement(&ack)
 }
 
+/// Install a signed actor package into an operator-owned ordinary Shared Agent
+/// replicated on this node. Uses the same credential lease as Local Install.
+pub(crate) fn run_install_shared(args: InstallLocalArgs) -> anyhow::Result<()> {
+    let (data, space, node_public, address) =
+        super::local_create::resolve_local_space(&args.space, args.http)?;
+    let agent = vos::agent::sdk::AgentId(
+        hex::decode(&args.agent)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid full Agent ID"))?,
+    );
+    let operator = crate::identity::load_existing()?;
+    let ack = install_agent(
+        &data,
+        address,
+        &operator,
+        space,
+        node_public,
+        agent,
+        &args,
+        true,
+    )?;
+    print_acknowledgement(&ack)
+}
+
 fn read_bounded(path: &std::path::Path, maximum: usize) -> anyhow::Result<Vec<u8>> {
     use std::io::Read as _;
     let mut bytes = Vec::new();
@@ -59,12 +83,37 @@ fn install_local(
     agent: vos::agent::sdk::AgentId,
     args: &InstallLocalArgs,
 ) -> anyhow::Result<ManagementApplicationAck> {
+    install_agent(
+        data,
+        address,
+        operator,
+        space,
+        node_public,
+        agent,
+        args,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_agent(
+    data: &std::path::Path,
+    address: std::net::SocketAddr,
+    operator: &libp2p::identity::Keypair,
+    space: vos::agent::sdk::SpaceId,
+    node_public: [u8; 32],
+    agent: vos::agent::sdk::AgentId,
+    args: &InstallLocalArgs,
+    shared: bool,
+) -> anyhow::Result<ManagementApplicationAck> {
     use super::clean_store::{
         CleanCredentialReservation, CleanLocalInstallFile, CredentialReservationStatus,
         ensure_private_directory,
     };
     use vos::agent::sdk::{AgentProfile, Hash, InstallationId, ProducerId};
-    super::local_config::require_image_local_lifecycle(data)?;
+    if !shared {
+        super::local_config::require_image_local_lifecycle(data)?;
+    }
     anyhow::ensure!(
         address.ip().is_loopback()
             && address.port() != 0
@@ -162,11 +211,26 @@ fn install_local(
                 authority,
             )?;
             let descriptor = discover_agent(address, operator, authority, credential.head, agent)?;
+            let node = super::clean_identity::node_id_from_authenticated_peer(
+                &libp2p::identity::PublicKey::from(
+                    libp2p::identity::ed25519::PublicKey::try_from_bytes(&node_public)
+                        .map_err(|_| anyhow::anyhow!("invalid node public key"))?,
+                )
+                .to_peer_id(),
+            );
             anyhow::ensure!(
-                descriptor.identity.profile == AgentProfile::Local
-                    && descriptor.identity.transition_producer
-                        == ProducerId::of_public_key(&node_public),
-                "target is not a Local Agent of this node"
+                if shared {
+                    descriptor.identity.profile == AgentProfile::Shared
+                        && descriptor
+                            .replicas
+                            .iter()
+                            .any(|replica| replica.node == node)
+                } else {
+                    descriptor.identity.profile == AgentProfile::Local
+                } && descriptor.identity.transition_producer
+                    == ProducerId::of_public_key(&node_public),
+                "target is not a {} Agent of this node",
+                if shared { "Shared" } else { "Local" }
             );
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -174,24 +238,41 @@ fn install_local(
             let expires = now
                 .checked_add(3600)
                 .ok_or_else(|| anyhow::anyhow!("validity overflow"))?;
-            let bytes = prepare(
-                operator,
-                authority,
-                &descriptor,
-                install,
-                package,
-                sequence,
-                now.saturating_sub(60),
-                expires,
-            )?
-            .encode();
+            let bytes = if shared {
+                prepare_shared(
+                    operator,
+                    authority,
+                    &descriptor,
+                    install,
+                    package,
+                    sequence,
+                    now.saturating_sub(60),
+                    expires,
+                )?
+                .encode()
+            } else {
+                prepare(
+                    operator,
+                    authority,
+                    &descriptor,
+                    install,
+                    package,
+                    sequence,
+                    now.saturating_sub(60),
+                    expires,
+                )?
+                .encode()
+            };
             store.publish_request(&bytes)?;
             bytes
         }
     };
-    let (install, call, _) = LocalInstallSubmission::decode(&request)
-        .map_err(|error| anyhow::anyhow!("invalid retained Install: {error:?}"))?
-        .into_parts();
+    anyhow::ensure!(
+        request.starts_with(if shared { b"SIQ1" } else { b"LIQ1" }),
+        "retained Install {} has a different Agent profile; resume it with its original command",
+        hex::encode(nonce.0)
+    );
+    let (install, call) = decode_retained_install(&request)?;
     anyhow::ensure!(
         install.installation_id.0 == nonce.0
             && call.authority == authority
@@ -448,6 +529,42 @@ pub(crate) fn prepare(
     valid_from: u64,
     expires_at: u64,
 ) -> anyhow::Result<LocalInstallSubmission> {
+    let call = sign_install_call(
+        operator, authority, descriptor, &install, &package, sequence, valid_from, expires_at,
+    )?;
+    LocalInstallSubmission::new(install, call, package)
+        .map_err(|error| anyhow::anyhow!("invalid signed Local Install: {error:?}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_shared(
+    operator: &libp2p::identity::Keypair,
+    authority: vos::agent::sdk::authority::AuthorityActorTarget,
+    descriptor: &vos::agent::sdk::AgentDescriptor,
+    install: vos::agent::sdk::InstallActor,
+    package: vos::agent::package_admission::AdmittedActorPackage,
+    sequence: std::num::NonZeroU64,
+    valid_from: u64,
+    expires_at: u64,
+) -> anyhow::Result<vos::agent::local_lifecycle::SharedInstallSubmission> {
+    let call = sign_install_call(
+        operator, authority, descriptor, &install, &package, sequence, valid_from, expires_at,
+    )?;
+    vos::agent::local_lifecycle::SharedInstallSubmission::new(install, call, package)
+        .map_err(|error| anyhow::anyhow!("invalid signed Shared Install: {error:?}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_install_call(
+    operator: &libp2p::identity::Keypair,
+    authority: vos::agent::sdk::authority::AuthorityActorTarget,
+    descriptor: &vos::agent::sdk::AgentDescriptor,
+    install: &vos::agent::sdk::InstallActor,
+    package: &vos::agent::package_admission::AdmittedActorPackage,
+    sequence: std::num::NonZeroU64,
+    valid_from: u64,
+    expires_at: u64,
+) -> anyhow::Result<vos::agent::sdk::authority::AuthorityCredentialCall> {
     use vos::agent::sdk::authority::{AuthorityCredentialCall, ManagedAgentTarget};
     use vos::agent::sdk::{InvocationId, ManagementRequest};
     let identity = super::clean_identity::CleanOperatorIdentitySigner::new(operator)?;
@@ -492,17 +609,38 @@ pub(crate) fn prepare(
         .sign(&call.signing_bytes())?
         .try_into()
         .map_err(|_| anyhow::anyhow!("Install signature must be Ed25519"))?;
-    LocalInstallSubmission::new(install, call, package)
-        .map_err(|error| anyhow::anyhow!("invalid signed Local Install: {error:?}"))
+    Ok(call)
+}
+
+/// Authenticate a retained LIQ1 (Local) or SIQ1 (Shared) Install request.
+pub(crate) fn decode_retained_install(
+    request: &[u8],
+) -> anyhow::Result<(
+    vos::agent::sdk::InstallActor,
+    vos::agent::sdk::authority::AuthorityCredentialCall,
+)> {
+    match request.get(..4) {
+        Some(b"SIQ1") => {
+            let (install, call, _) =
+                vos::agent::local_lifecycle::SharedInstallSubmission::decode(request)
+                    .map_err(|error| anyhow::anyhow!("invalid retained SIQ1: {error:?}"))?
+                    .into_parts();
+            Ok((install, call))
+        }
+        _ => {
+            let (install, call, _) = LocalInstallSubmission::decode(request)
+                .map_err(|error| anyhow::anyhow!("invalid retained Local Install: {error:?}"))?
+                .into_parts();
+            Ok((install, call))
+        }
+    }
 }
 
 pub(crate) fn verify_acknowledgement(
     request: &[u8],
     response: &[u8],
 ) -> anyhow::Result<ManagementApplicationAck> {
-    let submission = LocalInstallSubmission::decode(request)
-        .map_err(|error| anyhow::anyhow!("invalid retained Local Install: {error:?}"))?;
-    let (_, call, _) = submission.into_parts();
+    let (_, call) = decode_retained_install(request)?;
     super::local_create::verify_call_acknowledgement(&call, response)
 }
 
@@ -522,13 +660,28 @@ pub(crate) fn submit_retained(
         if let Some(bytes) = store.load_acknowledgement()? {
             return verify_acknowledgement(&request, &bytes);
         }
-        let response = super::local_create::post_binary(
+        let shared = request.starts_with(b"SIQ1");
+        let (status, response) = super::local_create::post_binary_response(
             address,
-            "/__agents/local/install",
+            if shared {
+                "/__agents/shared/install"
+            } else {
+                "/__agents/local/install"
+            },
             201,
             &request,
             vos::agent::sdk::wire::MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES,
+            shared.then_some(vos::agent::local_lifecycle::SharedInstallDenial::MAX_BYTES),
+            None,
         )?;
+        if status == 403 {
+            let (install, call) = decode_retained_install(&request)?;
+            vos::agent::local_lifecycle::SharedInstallDenial::verify(&install, &call, &response)
+                .map_err(|error| anyhow::anyhow!("invalid signed Install denial: {error:?}"))?;
+            anyhow::bail!(
+                "Shared Install was denied by Authority policy (verified signed denial); request retained"
+            );
+        }
         let acknowledgement = verify_acknowledgement(&request, &response)?;
         store.publish_acknowledgement(&response)?;
         Ok(acknowledgement)

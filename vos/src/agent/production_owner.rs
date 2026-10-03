@@ -1070,6 +1070,75 @@ impl AgentProductionOwner {
         Ok(acknowledgement)
     }
 
+    /// Ordinary Shared Create through the retained lifecycle, followed by
+    /// authenticated route reconciliation. Every attempt re-verifies retained
+    /// lifecycle evidence; a failure after application is retryable only with
+    /// the same signed submission and is not a rollback.
+    pub(crate) fn create_shared_agent(
+        &mut self,
+        submission: super::local_lifecycle::SharedCreateSubmission,
+    ) -> super::local_lifecycle::SharedCreateResult {
+        if !self.is_ready() {
+            return Err(AgentProductionOwnerError::InvalidConfiguration);
+        }
+        self.completed_local_publication = None;
+        self.completed_local_install = None;
+        let (lifecycle, _) = self
+            .lifecycle
+            .as_mut()
+            .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
+        let acknowledgement = lifecycle
+            .create_shared(submission)
+            .map_err(AgentProductionOwnerError::Lifecycle)?;
+        self.reconcile()?;
+        Ok(acknowledgement)
+    }
+
+    /// Ordinary Shared Install completion requires the verified actor route to
+    /// be published from the Authority projection and the physical generation.
+    pub(crate) fn install_shared_actor(
+        &mut self,
+        submission: super::local_lifecycle::SharedInstallSubmission,
+    ) -> super::local_lifecycle::SharedInstallResult {
+        use super::local_lifecycle::SharedInstallDisposition;
+        if !self.is_ready() {
+            return Err(AgentProductionOwnerError::InvalidConfiguration);
+        }
+        self.completed_local_publication = None;
+        self.completed_local_install = None;
+        let call = submission.call();
+        let install = submission.install();
+        let key = AgentRouteKey::new(call.managed.space, call.managed.agent, install.entry.actor)?;
+        let runtime = call.managed.runtime_deployment;
+        let deployment = install.entry.deployment;
+        let program = install.entry.program;
+        let (lifecycle, _) = self
+            .lifecycle
+            .as_mut()
+            .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
+        let disposition = lifecycle
+            .install_shared(submission)
+            .map_err(AgentProductionOwnerError::Lifecycle)?;
+        if matches!(disposition, SharedInstallDisposition::Denied(_)) {
+            return Ok(disposition);
+        }
+        self.reconcile()?;
+        let supervisor = self
+            .supervisor
+            .as_ref()
+            .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
+        let identity = supervisor.handle().snapshot(key)?.identity();
+        if identity.key() != key
+            || identity.runtime_deployment() != runtime
+            || identity.actor_deployment() != deployment
+            || identity.actor_program() != program
+            || identity.profile() != AgentProfile::Shared
+        {
+            return Err(AgentProductionOwnerError::InvalidProjection);
+        }
+        Ok(disposition)
+    }
+
     pub(crate) fn is_running(&self) -> bool {
         self.supervisor
             .as_ref()

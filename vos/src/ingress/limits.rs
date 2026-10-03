@@ -17,6 +17,12 @@ pub(crate) fn request_body_limit(method: &http::Method, uri: &http::Uri) -> usiz
             "/__agents/local/install" => {
                 return crate::agent::local_lifecycle::LocalInstallSubmission::MAX_BYTES;
             }
+            "/__agents/shared" => {
+                return crate::agent::local_lifecycle::SharedCreateSubmission::MAX_BYTES;
+            }
+            "/__agents/shared/install" => {
+                return crate::agent::local_lifecycle::SharedInstallSubmission::MAX_BYTES;
+            }
             _ => {}
         }
     }

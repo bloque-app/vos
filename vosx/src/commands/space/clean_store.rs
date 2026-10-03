@@ -485,8 +485,9 @@ impl StoreRole {
             Self::SharedInstallHandoff => {
                 vos::agent::clean_authority_issuer::MAX_CLEAN_SHARED_INSTALL_HANDOFF_BYTES
             }
+            // Retains LCQ1 or the strictly larger SCQ1 ordinary Shared Create.
             Self::LocalCreateRequest => {
-                vos::agent::local_lifecycle::LocalCreateSubmission::MAX_BYTES
+                vos::agent::local_lifecycle::SharedCreateSubmission::MAX_BYTES
             }
             Self::LocalInstallRequest => {
                 vos::agent::local_lifecycle::LocalInstallSubmission::MAX_BYTES
@@ -2137,10 +2138,8 @@ impl CleanCredentialReservation {
             .ok_or(CleanFileStoreError::RequestConflict)?;
         let ack = super::local_install::verify_acknowledgement(&request, &response)
             .map_err(|_| CleanFileStoreError::Corrupt)?;
-        let (install, call, _) =
-            vos::agent::local_lifecycle::LocalInstallSubmission::decode(&request)
-                .map_err(|_| CleanFileStoreError::Corrupt)?
-                .into_parts();
+        let (install, call) = super::local_install::decode_retained_install(&request)
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
         if call.managed.space != self.space || call.credential != self.credential {
             return Err(CleanFileStoreError::Corrupt);
         }
@@ -2417,9 +2416,9 @@ impl CleanLocalInstallFile {
         if bytes.len() > StoreRole::LocalInstallRequest.maximum_bytes() {
             return Err(CleanFileStoreError::Oversized);
         }
-        let submission = vos::agent::local_lifecycle::LocalInstallSubmission::decode(bytes)
+        let (_, call) = super::local_install::decode_retained_install(bytes)
             .map_err(|_| CleanFileStoreError::Corrupt)?;
-        if submission.into_parts().1.authenticated_node.is_some() {
+        if call.authenticated_node.is_some() {
             return Err(CleanFileStoreError::Corrupt);
         }
         Ok(())
@@ -4627,7 +4626,7 @@ pub(crate) mod tests {
         let second = local_request(3);
         assert_eq!(
             StoreRole::LocalCreateRequest.maximum_bytes(),
-            vos::agent::local_lifecycle::LocalCreateSubmission::MAX_BYTES
+            vos::agent::local_lifecycle::SharedCreateSubmission::MAX_BYTES
         );
         assert_eq!(
             StoreRole::LocalInstallRequest.maximum_bytes(),

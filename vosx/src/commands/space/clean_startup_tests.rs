@@ -2255,3 +2255,344 @@ fn check_shared_file_recovery_with_candidate(
         .expect("all lifecycle owners released")
         .join();
 }
+
+/// Single-voter ordinary Shared Agent through the released production owner:
+/// signed Create (daemon root endorsement and replay-verified finality),
+/// Install and a public Query through the published supervisor route. Every
+/// owner is dropped and the space reopened with the production verifier
+/// (`UnavailableAgentFinality`); no test finality is installed anywhere.
+#[test]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF; production Shared Create/Install/Invoke and reopen"]
+fn candidate_shared_agent_create_install_invoke_reopens_without_test_finality() {
+    use crate::commands::space::clean_store::ensure_private_directory;
+    use vos::Encode as _;
+    use vos::agent::local_lifecycle::{
+        SharedCreateSubmission, SharedInstallDisposition, SharedInstallSubmission,
+    };
+    use vos::agent::sdk::catalog::{CatalogActorTarget, CatalogPageRequest};
+    use vos::agent::sdk::wire::CanonicalWire as _;
+    use vos::agent::sdk::{
+        DeploymentId, InvocationAuthorization, InvocationOrigin, InvocationRoleClaims,
+        InvocationStatus, MethodMode, ProgramId, PublicPreflight, RuntimeExecutionContext,
+        RuntimeOutcome,
+    };
+    use vos::agent::supervisor::AgentRouteKey;
+    use vos::agent::supervisor_adapters::{
+        AgentAcknowledgementRequest, AgentInvocationIntent, AgentInvocationRequest,
+        AgentInvocationResponse, AgentTargetedPreparationRequest, dispatch_encoded_acknowledgement,
+        dispatch_encoded_invocation, prepare_targeted_invocation,
+    };
+
+    let elf = PathBuf::from(std::env::var("AUTHORITY_CANDIDATE_ELF").unwrap());
+    let scratch = Scratch::new();
+    let data = scratch.0.join("space");
+    drop(ensure_private_directory(&data).unwrap());
+    let lock = scratch.0.join("agent-host.lock");
+    let operator = Keypair::ed25519_from_bytes([0x91; 32]).unwrap();
+    let daemon = Keypair::ed25519_from_bytes([0x92; 32]).unwrap();
+    let peer = daemon.public().to_peer_id();
+    let network = Arc::new(Network::start(NetworkConfig {
+        keypair: daemon.clone(),
+        local_prefix: derive_node_prefix(&peer),
+        listen: vec![],
+        bootstrap: vec![],
+        auto_dial_mdns: false,
+    }));
+    let space = SpaceId([0x93; 32]);
+    let inputs = candidate_authority_inputs(&operator, &elf);
+    let start = || {
+        let (node, lifecycle) = open_clean_system_lifecycle_with_inputs(
+            network.clone(),
+            &data,
+            space.0,
+            &operator,
+            &daemon,
+            crate::commands::space::local_config::LocalAgentStorage::Image,
+            &lock,
+            None,
+            Some(&inputs),
+        )
+        .unwrap();
+        let mut vos_node = VosNode::new();
+        vos_node
+            .start_clean_local_agent_production(
+                node,
+                lifecycle,
+                Box::new(OperatorAuthorityProjectionAuthenticator::new(operator.clone()).unwrap()),
+                AgentSupervisorLimits::default(),
+                PROJECTION_ROUTE_QUEUE_CAPACITY,
+                PROJECTION_RECONCILE_INTERVAL,
+            )
+            .unwrap();
+        (node, vos_node)
+    };
+    let (node, mut vos_node) = start();
+
+    // Signed single-voter Create, exactly as `vosx space create-shared-agent`.
+    let runtime = inputs.runtime.clone();
+    let public = raw_public_key(&operator).unwrap();
+    let owner = PrincipalId::of_public_key(&public);
+    let (authority, _) =
+        derive_system_authority_target(space, public, &runtime, &inputs.authority).unwrap();
+    let nonce = Hash([0x94; 32]);
+    let agent = AgentId::derive(space, owner, nonce.as_bytes());
+    let descriptor = AgentDescriptor {
+        identity: AgentIdentity {
+            space,
+            agent,
+            owner,
+            profile: AgentProfile::Shared,
+            runtime_deployment: runtime.deployment(),
+            runtime_program: runtime.program(),
+            runtime_producer: runtime.producer(),
+            transition_producer: ProducerId::of_public_key(&raw_public_key(&daemon).unwrap()),
+        },
+        creation_nonce: nonce,
+        authority: authority.binding,
+        private_recovery: None,
+        runtime_package: runtime.package_ref().clone(),
+        runtime_contract: runtime.manifest().contract,
+        capabilities: runtime.capabilities(),
+        replicas: vec![AgentReplica {
+            node,
+            principal: owner,
+            role: ReplicaRole::Voter,
+        }],
+    };
+    let peer_bytes = peer.to_bytes();
+    let replicas = AgentReplicaCommittee::new(
+        HostSpaceId(space.0),
+        HostAgentId(agent.0),
+        HostAgentProfile::Shared,
+        vec![
+            AgentReplicaMember::new(
+                vos::agent::AgentReplica {
+                    node: HostNodeId(node.0),
+                    principal: HostPrincipalId(owner.0),
+                    role: HostReplicaRole::Voter,
+                },
+                peer_bytes.clone(),
+                raw_public_key(&daemon).unwrap(),
+                Some(derive_replica_raft_slot(&peer_bytes)),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let request = ManagementRequest::Create(Box::new(descriptor.clone()));
+    let mut call = AuthorityCredentialCall {
+        invocation: InvocationId::ZERO,
+        authority,
+        managed: ManagedAgentTarget {
+            space,
+            agent,
+            owner,
+            profile: AgentProfile::Shared,
+            runtime_deployment: runtime.deployment(),
+            transition_producer: descriptor.identity.transition_producer,
+        },
+        principal: owner,
+        credential: CredentialId::of_public_key(&public),
+        request_sequence: NonZeroU64::new(2).unwrap(),
+        credential_public_key: public,
+        authenticated_node: None,
+        requested_valid_from: system_logical_slot().unwrap(),
+        requested_expires_at: u64::MAX,
+        plan: request.authorization_plan().unwrap(),
+        signature: [0; 64],
+    };
+    call.invocation = call.expected_invocation();
+    call.signature = sign_exact(&operator, &call.signing_bytes()).unwrap();
+    let create = SharedCreateSubmission::new(
+        descriptor.clone(),
+        call.clone(),
+        runtime.clone(),
+        replicas.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        SharedCreateSubmission::decode(&create.encode())
+            .unwrap()
+            .encode(),
+        create.encode()
+    );
+    let created = vos_node.create_clean_shared_agent(create.clone()).unwrap();
+    assert_eq!(created.credential_call, call.commitment());
+    assert_eq!(
+        vos_node.create_clean_shared_agent(create.clone()).unwrap(),
+        created,
+        "exact Create retry must return the original signed ACK"
+    );
+    let journal = data
+        .join(SHARED_AGENT_HOST_DIRECTORY)
+        .join(format!("{}.agent", hex::encode(agent.0)));
+    assert!(journal.exists());
+
+    // Signed Install of the bundled catalog actor into the Shared Agent.
+    let package = inputs.catalog.clone();
+    let configuration = SystemCatalogConfiguration {
+        space: space.0,
+        system_agent: agent.0,
+        system_runtime_deployment: runtime.deployment().0,
+        actor: ActorId::top_level(agent, "shared-catalog").0,
+        deployment: package.deployment().0,
+        program: package.program().0,
+        authority: CatalogAuthorityState {
+            policy: authority.binding.policy.0,
+            issuer: CatalogIssuerState {
+                principal: authority.binding.issuer.principal.0,
+                actor: authority.binding.issuer.actor.0,
+                deployment: authority.binding.issuer.deployment.0,
+                program: authority.binding.issuer.program.0,
+                producer: authority.binding.issuer.producer.0,
+            },
+            public_key: authority.binding.public_key,
+            initial_epoch: authority.binding.initial_epoch,
+        },
+    };
+    assert!(configuration.is_valid());
+    let install = crate::commands::space::local_install::build_install(
+        agent,
+        vos::agent::sdk::InstallationId([0x95; 32]),
+        Hash([0x96; 32]),
+        "shared-catalog".into(),
+        None,
+        Some(configuration.encode()),
+        &package,
+    )
+    .unwrap();
+    let actor = install.entry.actor;
+    let mut install_call = call.clone();
+    install_call.request_sequence = NonZeroU64::new(3).unwrap();
+    install_call.plan = ManagementRequest::Install(Box::new(install.clone()))
+        .authorization_plan()
+        .unwrap();
+    install_call.requested_expires_at = inputs.clock.load(Ordering::Acquire) + 10_000;
+    install_call.invocation = install_call.expected_invocation();
+    install_call.signature = sign_exact(&operator, &install_call.signing_bytes()).unwrap();
+    let submission =
+        SharedInstallSubmission::new(install.clone(), install_call.clone(), package.clone())
+            .unwrap();
+    let SharedInstallDisposition::Installed(installed) = vos_node
+        .install_clean_shared_actor(submission.clone())
+        .unwrap()
+    else {
+        panic!("operator Shared Install must apply");
+    };
+    assert_eq!(installed.credential_call, install_call.commitment());
+    assert_eq!(
+        vos_node
+            .install_clean_shared_actor(submission.clone())
+            .unwrap(),
+        SharedInstallDisposition::Installed(installed.clone()),
+        "exact Install retry must return the original signed ACK"
+    );
+
+    // Public catalog Query through the production supervisor route.
+    let target = CatalogActorTarget {
+        space,
+        system_agent: agent,
+        system_runtime_deployment: runtime.deployment(),
+        actor,
+        deployment: DeploymentId(configuration.deployment),
+        program: ProgramId(configuration.program),
+        authority: authority.binding,
+    };
+    let page = CatalogPageRequest {
+        catalog: target,
+        namespace: "shared-smoke".into(),
+        after: None,
+        limit: 1,
+    };
+    let invoke = |vos_node: &VosNode, seed: u8| -> Vec<u8> {
+        let supervisor = vos_node
+            .clean_agent_supervisor()
+            .expect("Shared routes must be published");
+        let key = AgentRouteKey::new(space, agent, actor).unwrap();
+        let mut message = vec![vos::value::TAG_DYNAMIC];
+        message.extend_from_slice(
+            &vos::value::Msg::new("page")
+                .with("request", page.encode().unwrap())
+                .encode(),
+        );
+        let preparation = AgentTargetedPreparationRequest::new(
+            key,
+            AgentInvocationIntent::new(
+                InvocationId([seed; 32]),
+                MethodMode::Query,
+                InvocationOrigin::anonymous(),
+                InvocationRoleClaims::none(),
+                message,
+                vos::agent::execution::MAX_EXECUTION_GAS,
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let response = prepare_targeted_invocation(&supervisor, &preparation).unwrap();
+        let prepared = response.for_request(&preparation).unwrap();
+        assert_eq!(prepared.profile(), AgentProfile::Shared);
+        let work = prepared.work().clone();
+        let authorization = InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(
+            &work,
+            prepared.observed_slot(),
+        ));
+        let request = AgentInvocationRequest::new(
+            RuntimeExecutionContext::Direct,
+            work.clone(),
+            authorization.clone(),
+        )
+        .unwrap();
+        let AgentInvocationResponse::Direct {
+            outcome: RuntimeOutcome::Completed(Ok(reply)),
+            ..
+        } = dispatch_encoded_invocation(
+            &supervisor,
+            supervisor.snapshot(key).unwrap(),
+            &request.encode().unwrap(),
+        )
+        .unwrap()
+        else {
+            panic!("public Shared Query must complete directly");
+        };
+        assert_eq!(reply.status, InvocationStatus::Done);
+        assert!(!reply.reply.is_empty());
+        let acknowledgement = AgentAcknowledgementRequest::new(
+            RuntimeExecutionContext::Direct,
+            None,
+            work,
+            authorization,
+        )
+        .unwrap();
+        dispatch_encoded_acknowledgement(
+            &supervisor,
+            supervisor.snapshot(key).unwrap(),
+            &acknowledgement.encode().unwrap(),
+        )
+        .unwrap();
+        reply.reply
+    };
+    let before = invoke(&vos_node, 0x97);
+    let applied = journal_files(&journal);
+
+    // Drop every owner: production worker, lifecycle, host and stores.
+    vos_node.collect_checked().unwrap();
+    let (reopened_node, mut vos_node) = start();
+    assert_eq!(reopened_node, node);
+    assert_eq!(
+        vos_node.create_clean_shared_agent(create).unwrap(),
+        created,
+        "reopened Create retry must keep the original ACK"
+    );
+    assert_eq!(
+        vos_node.install_clean_shared_actor(submission).unwrap(),
+        SharedInstallDisposition::Installed(installed),
+        "reopened Install retry must keep the original ACK"
+    );
+    assert_eq!(invoke(&vos_node, 0x98), before);
+    assert!(
+        journal_files(&journal).len() >= applied.len(),
+        "reopen must keep the applied generation"
+    );
+    vos_node.collect_checked().unwrap();
+}

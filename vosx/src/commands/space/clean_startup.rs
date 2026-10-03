@@ -75,6 +75,8 @@ const OPERATION_DENIALS_DIRECTORY: &str = "authority-operation-denials";
 const ADMIN_DISPATCH_DIRECTORY: &str = "authority-admin-dispatch";
 const ADMIN_RESULTS_DIRECTORY: &str = "authority-admin-results";
 const ADMIN_RETIREMENTS_DIRECTORY: &str = "authority-admin-retirements";
+/// Durable per-locator genesis endorsements signed by this node's root key.
+const SHARED_ENDORSEMENT_DIRECTORY: &str = "shared-agent-endorsement";
 const PROJECTION_ROUTE_QUEUE_CAPACITY: usize = 64;
 const LOCAL_LIFECYCLE_RECOVERY_LIMIT: usize = 1_024;
 const PROJECTION_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
@@ -1040,7 +1042,12 @@ fn open_clean_system_lifecycle_with_roster_policy(
         )
         .map_err(|error| {
             anyhow::anyhow!("complete Shared recovery before routes; preserved stores: {error:?}")
-        })?;
+        })?
+        .with_shared_genesis_endorser(shared_genesis_endorser(
+            data_dir.join(SHARED_ENDORSEMENT_DIRECTORY),
+            operator.clone(),
+        ))
+        .map_err(|error| anyhow::anyhow!("retain Shared genesis endorser: {error:?}"))?;
     report_phase("shared_lifecycle_recovery");
     let lifecycle = lifecycle
         .with_operations(
@@ -1055,6 +1062,41 @@ fn open_clean_system_lifecycle_with_roster_policy(
 #[cfg(test)]
 #[path = "clean_startup_tests.rs"]
 mod tests;
+
+/// The root operator key endorses ordinary Shared genesis candidates prepared
+/// by the owner. Each signature is retained under its locator before return,
+/// so a retry reuses it; quorum selection and publication stay owner-checked.
+fn shared_genesis_endorser(
+    root: std::path::PathBuf,
+    operator: Keypair,
+) -> impl vos::agent::local_lifecycle::SharedGenesisEndorser + 'static {
+    use vos::agent::shared_host::SharedAgentHostError;
+    struct RootSigner<'a>(&'a Keypair);
+    impl vos::agent::clean_bootstrap::GenesisClaimSigner for RootSigner<'_> {
+        type Error = anyhow::Error;
+        fn public_key(&self) -> [u8; 32] {
+            raw_public_key(self.0).unwrap_or([0; 32])
+        }
+        fn sign_genesis_claim(&mut self, message: &[u8; 32]) -> anyhow::Result<[u8; 64]> {
+            sign_exact(self.0, message)
+        }
+    }
+    move |locator: vos::agent::genesis::AgentGenesisLocator,
+          prepared: &vos::agent::clean_bootstrap::PreparedSharedGenesisEndorsement| {
+        let public = raw_public_key(&operator).map_err(|_| SharedAgentHostError::Unavailable)?;
+        let _directory = super::clean_store::ensure_private_directory(&root)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let mut store = super::clean_store::CleanAgentGenesisSignatureFile::open_or_create(
+            &root,
+            locator,
+            vos::agent::committee::AuthoritySignerId::of_raw_ed25519(&public),
+        )
+        .map_err(|_| SharedAgentHostError::Unavailable)?;
+        Ok(vec![
+            prepared.endorse(&mut store, &mut RootSigner(&operator))?,
+        ])
+    }
+}
 
 fn install_request(
     agent: AgentId,

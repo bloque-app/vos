@@ -251,8 +251,22 @@ fn authorize_with_application_validity(
                     credential.head,
                     intent.target().agent(),
                 )?;
+                // Ordinary Shared Agents replicated on this node use the same
+                // credential-reserved invocation path as Local Agents.
+                let local_node = super::clean_identity::node_id_from_authenticated_peer(
+                    &libp2p::identity::PublicKey::from(
+                        libp2p::identity::ed25519::PublicKey::try_from_bytes(&node_public)
+                            .map_err(|_| anyhow::anyhow!("invalid node public key"))?,
+                    )
+                    .to_peer_id(),
+                );
                 anyhow::ensure!(
-                    descriptor.identity.profile == AgentProfile::Local
+                    (descriptor.identity.profile == AgentProfile::Local
+                        || (descriptor.identity.profile == AgentProfile::Shared
+                            && descriptor
+                                .replicas
+                                .iter()
+                                .any(|replica| replica.node == local_node)))
                         && descriptor.identity.owner == identity.principal()
                         && descriptor.identity.transition_producer
                             == ProducerId::of_public_key(&node_public),
@@ -318,7 +332,10 @@ fn authorize_with_application_validity(
                 call.authority == authority
                     && call.principal == identity.principal()
                     && call.credential == identity.credential()
-                    && call.intent.managed().profile == AgentProfile::Local
+                    && matches!(
+                        call.intent.managed().profile,
+                        AgentProfile::Local | AgentProfile::Shared
+                    )
                     && call.intent.managed().owner == identity.principal()
                     && call.intent.managed().transition_producer
                         == ProducerId::of_public_key(&node_public)
@@ -351,7 +368,7 @@ fn authorize_with_application_validity(
             && call.credential == identity.credential()
             && call.authenticated_node().is_none()
             && managed.space == space
-            && managed.profile == AgentProfile::Local
+            && matches!(managed.profile, AgentProfile::Local | AgentProfile::Shared)
             && managed.owner == identity.principal()
             && managed.transition_producer == ProducerId::of_public_key(&node_public)
             && operation_invocation.0 == nonce.0,
