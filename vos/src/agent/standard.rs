@@ -63,6 +63,29 @@ pub(crate) struct ResolvedCleanInvocation<'work> {
     work: &'work crate::agent_sdk::InvocationWork,
     actor: ActorRecord,
     parts: CleanInvocationParts<&'work [u8]>,
+    /// The work came from the canonical decoder of this execution, which
+    /// validated its metadata and availability preimages.
+    work_validated: bool,
+}
+
+impl ResolvedCleanInvocation<'_> {
+    /// The authenticated availability reference of the resolved program.
+    pub(crate) fn program_reference(&self) -> Option<crate::agent_sdk::BlobRef> {
+        let program = self.parts.1;
+        self.work
+            .availability
+            .iter()
+            .find(|blob| core::ptr::eq(blob.bytes.as_slice(), program))
+            .map(|blob| blob.reference.clone())
+    }
+
+    pub(crate) fn actor_id(&self) -> ActorId {
+        self.actor.entry.actor
+    }
+
+    pub(crate) fn work_validated(&self) -> bool {
+        self.work_validated
+    }
 }
 
 impl<'work> ResolvedCleanInvocation<'work> {
@@ -197,6 +220,10 @@ pub struct StandardAgentRuntime {
     private_management_dispositions: Vec<StandardPrivateManagementDisposition>,
     system_authority: Option<super::system_authority::SystemAuthorityState>,
     actors: BTreeMap<ActorId, ManagedActor>,
+    /// Guest-verified program bindings: for an installed actor, the
+    /// availability reference whose bytes this runtime has hashed to the
+    /// actor's current ProgramId. Valid only while that ProgramId is current.
+    program_bindings: BTreeMap<ActorId, StandardProgramBinding>,
     /// Installation identities remain consumed after their actor leaves the
     /// live directory, preventing an install replay from becoming a new
     /// incarnation after `RemoveLeaf`.
@@ -266,6 +293,22 @@ pub struct StandardRuntimeState {
     pub authority_slot_high_water: Option<u64>,
     pub authority_sequence_high_water: Option<u64>,
     pub authority_dispositions: Vec<StandardAuthorityDisposition>,
+    /// Guest-verified program bindings, ordered by actor. Empty in every image
+    /// written before an actor's first invocation, which then encodes exactly
+    /// as it did before bindings existed.
+    pub program_bindings: Vec<StandardProgramBinding>,
+}
+
+/// The availability reference of one actor's program, bound to its ProgramId
+/// by this runtime: on the first invocation that resolved the program, the
+/// guest computed the ProgramId of the exact bytes it then executed, and those
+/// bytes had just been authenticated against `reference` by the work decoder.
+/// Later invocations identify the program by that verified reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandardProgramBinding {
+    pub actor: ActorId,
+    pub program: ProgramId,
+    pub reference: crate::agent_sdk::BlobRef,
 }
 
 /// Replay-only durable objects selected by an authenticated native reapply.
@@ -1286,6 +1329,7 @@ impl StandardAgentRuntime {
             private_management_dispositions: Vec::new(),
             system_authority: None,
             actors: BTreeMap::new(),
+            program_bindings: BTreeMap::new(),
             retired_installation_ids: BTreeSet::new(),
             lane_state: StandardLaneState {
                 linear: Vec::new(),
@@ -1422,7 +1466,34 @@ impl StandardAgentRuntime {
             authority_slot_high_water: self.authority_slot_high_water,
             authority_sequence_high_water: self.authority_sequence_high_water,
             authority_dispositions: self.authority_dispositions.clone(),
+            program_bindings: self.program_bindings.values().cloned().collect(),
         }
+    }
+
+    /// The verified reference bound to `actor`'s current program, if any.
+    fn bound_program_reference(&self, actor: ActorId) -> Option<&crate::agent_sdk::BlobRef> {
+        let binding = self.program_bindings.get(&actor)?;
+        let current = self.actors.get(&actor)?;
+        (current.record.entry.program == binding.program).then_some(&binding.reference)
+    }
+
+    /// Record that the bytes behind `reference` are `actor`'s current program.
+    /// Callers pass only a reference the decoder authenticated for bytes whose
+    /// ProgramId this guest has just computed (`resolve_clean_invocation`).
+    #[cfg(feature = "pvm")]
+    pub(crate) fn bind_program(&mut self, actor: ActorId, reference: crate::agent_sdk::BlobRef) {
+        let Some(current) = self.actors.get(&actor) else {
+            return;
+        };
+        let program = current.record.entry.program;
+        self.program_bindings.insert(
+            actor,
+            StandardProgramBinding {
+                actor,
+                program,
+                reference,
+            },
+        );
     }
 
     /// Drop only lane entries which do not belong to an active install.
@@ -1900,6 +1971,27 @@ impl StandardAgentRuntime {
             return Err(LifecycleError::InvalidRequest);
         }
         runtime.retired_installation_ids = state.retired_installation_ids.into_iter().collect();
+        if state
+            .program_bindings
+            .windows(2)
+            .any(|pair| pair[0].actor >= pair[1].actor)
+        {
+            return Err(LifecycleError::InvalidRequest);
+        }
+        for binding in state.program_bindings {
+            // Canonical images bind only installed actors, at their current
+            // program, by a nonempty reference.
+            if binding.reference.len == 0
+                || binding.reference.len > super::execution::MAX_EXECUTION_PROGRAM_BYTES as u64
+                || runtime
+                    .actors
+                    .get(&binding.actor)
+                    .is_none_or(|actor| actor.record.entry.program != binding.program)
+            {
+                return Err(LifecycleError::InvalidRequest);
+            }
+            runtime.program_bindings.insert(binding.actor, binding);
+        }
         for (actor, expected_deployment) in suspended {
             runtime.set_suspended(actor, expected_deployment, true)?;
         }
@@ -2659,9 +2751,39 @@ impl StandardAgentRuntime {
         observed_slot: u64,
     ) -> Result<Option<super::execution::ActorExecutionReply>, crate::agent_sdk::InvocationError>
     {
+        self.verify_clean_invocation_authorization(work, authorization, observed_slot)?;
+        self.recover_clean_execution_after_authorization(work, authorization, observed_slot)
+    }
+
+    /// [`Self::recover_clean_execution`] for work the decoder has just
+    /// validated: authorization is still verified, but the work's metadata and
+    /// availability preimages are not hashed a second time.
+    #[cfg(feature = "pvm")]
+    pub(super) fn recover_validated_clean_execution(
+        &mut self,
+        validated: super::wire::ValidatedInvocationWork<'_>,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+    ) -> Result<Option<super::execution::ActorExecutionReply>, crate::agent_sdk::InvocationError>
+    {
+        let work = validated.work();
+        self.verify_clean_invocation_authorization_after_work_validation(
+            work,
+            authorization,
+            observed_slot,
+        )?;
+        self.recover_clean_execution_after_authorization(work, authorization, observed_slot)
+    }
+
+    fn recover_clean_execution_after_authorization(
+        &mut self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+    ) -> Result<Option<super::execution::ActorExecutionReply>, crate::agent_sdk::InvocationError>
+    {
         use crate::agent_sdk::InvocationError;
 
-        self.verify_clean_invocation_authorization(work, authorization, observed_slot)?;
         // Acknowledgement deletes the delivered reply, not the consumed
         // invocation identity. Treating that absent reply as unseen work would
         // execute the same mutation again. Keep exact ACK retries available,
@@ -2994,10 +3116,22 @@ impl StandardAgentRuntime {
         let mut schema_index = None;
         let mut policy_index = None;
         let mut installation_data_index = None;
+        // A bound program is identified by the reference the decoder
+        // authenticated its bytes against; its ProgramId was computed by this
+        // guest over those bytes on an earlier invocation. Otherwise every
+        // candidate is hashed to its ProgramId.
+        let bound = self.bound_program_reference(actor_id);
         for (index, blob) in work.availability.iter().enumerate() {
-            if blob.bytes.len() <= super::execution::MAX_EXECUTION_PROGRAM_BYTES
-                && crate::agent_sdk::ProgramId::of_pvm(&blob.bytes) == work.program
-            {
+            let is_program = match bound {
+                Some(reference) => {
+                    blob.reference == *reference && blob.bytes.len() as u64 == reference.len
+                }
+                None => {
+                    blob.bytes.len() <= super::execution::MAX_EXECUTION_PROGRAM_BYTES
+                        && crate::agent_sdk::ProgramId::of_pvm(&blob.bytes) == work.program
+                }
+            };
+            if is_program {
                 if program_index.replace(index).is_some() {
                     return Err(InvocationError::InvalidAvailability);
                 }
@@ -3129,7 +3263,24 @@ impl StandardAgentRuntime {
             .clean_invocation_target(work.actor, work.incarnation, work.deployment, work.program)?
             .record
             .clone();
-        Ok(ResolvedCleanInvocation { work, actor, parts })
+        Ok(ResolvedCleanInvocation {
+            work,
+            actor,
+            parts,
+            work_validated: false,
+        })
+    }
+
+    /// [`Self::resolve_clean_invocation_for_execution`] for work the decoder
+    /// has just validated; its commit does not re-hash the availability.
+    #[cfg(feature = "pvm")]
+    pub(super) fn resolve_validated_clean_invocation_for_execution<'work>(
+        &self,
+        validated: super::wire::ValidatedInvocationWork<'work>,
+    ) -> Result<ResolvedCleanInvocation<'work>, crate::agent_sdk::InvocationError> {
+        let mut resolved = self.resolve_clean_invocation_for_execution(validated.work())?;
+        resolved.work_validated = true;
+        Ok(resolved)
     }
 
     #[cfg(feature = "pvm")]
@@ -4255,6 +4406,7 @@ impl StandardAgentRuntime {
             observed_slot,
             terminal_continuation,
             None,
+            false,
         )
     }
 
@@ -4282,6 +4434,7 @@ impl StandardAgentRuntime {
             observed_slot,
             terminal_continuation,
             Some(&resolved.actor),
+            resolved.work_validated,
         )
     }
 
@@ -4297,10 +4450,19 @@ impl StandardAgentRuntime {
         observed_slot: u64,
         terminal_continuation: Option<u64>,
         resolved_actor: Option<&ActorRecord>,
+        work_validated: bool,
     ) -> Result<(), super::execution::ActorExecutionError> {
         use super::execution::ActorExecutionError;
 
-        self.verify_clean_invocation_authorization(work, authorization, observed_slot)
+        if work_validated {
+            self.verify_clean_invocation_authorization_after_work_validation(
+                work,
+                authorization,
+                observed_slot,
+            )
+        } else {
+            self.verify_clean_invocation_authorization(work, authorization, observed_slot)
+        }
             .map_err(|error| match error {
                 crate::agent_sdk::InvocationError::NotCreated => ActorExecutionError::NotCreated,
                 _ => ActorExecutionError::InvalidAuthorization,
@@ -5354,6 +5516,14 @@ impl StandardAgentRuntime {
                 ])
                 .chain(installation_data),
         )?;
+        if self
+            .program_bindings
+            .get(&upgrade.actor)
+            .is_some_and(|binding| binding.program != upgrade.to_program)
+        {
+            // A binding names one ProgramId; a new program is bound afresh.
+            self.program_bindings.remove(&upgrade.actor);
+        }
         let actor = self
             .actors
             .get_mut(&upgrade.actor)
@@ -5446,6 +5616,7 @@ impl StandardAgentRuntime {
         }
         let installation_id = managed.record.installation_id;
         self.actors.remove(&actor);
+        self.program_bindings.remove(&actor);
         let inserted = self.retired_installation_ids.insert(installation_id);
         debug_assert!(inserted, "a live installation cannot already be retired");
         Ok(LifecycleReply::Removed(actor))

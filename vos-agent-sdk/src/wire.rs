@@ -4190,6 +4190,14 @@ fn decode_resume_input(decoder: &mut Decoder<'_>) -> Result<ResumeInput, DecodeE
 }
 
 fn encode_resume_work(encoder: &mut Encoder<'_>, value: &ResumeWork) {
+    encode_resume_work_with_availability(encoder, value, true);
+}
+
+fn encode_resume_work_with_availability(
+    encoder: &mut Encoder<'_>,
+    value: &ResumeWork,
+    include_preimages: bool,
+) {
     encoder.fixed(value.invocation.as_bytes());
     encoder.fixed(value.actor.as_bytes());
     encoder.fixed(value.incarnation.as_bytes());
@@ -4199,7 +4207,13 @@ fn encode_resume_work(encoder: &mut Encoder<'_>, value: &ResumeWork) {
     encode_blob(encoder, &value.continuation);
     encoder.u64(value.ready_sequence);
     encode_optional_blob(encoder, &value.installation_data);
-    encoder.list(&value.availability, encode_runtime_blob);
+    if include_preimages {
+        encoder.list(&value.availability, encode_runtime_blob);
+    } else {
+        encoder.list(&value.availability, |encoder, blob| {
+            encode_blob(encoder, &blob.reference);
+        });
+    }
     encoder.option(&value.input, encode_resume_input);
 }
 
@@ -4370,81 +4384,7 @@ impl CanonicalWire for RuntimeWork {
     }
 
     fn encode_body(&self, encoder: &mut Encoder<'_>) {
-        match self {
-            RuntimeWork::Manage {
-                context,
-                space,
-                agent,
-                runtime_deployment,
-                state,
-                request,
-                authority,
-                observed_slot,
-            } => {
-                encoder.u8(0);
-                encode_runtime_execution_context(encoder, *context);
-                encoder.fixed(space.as_bytes());
-                encoder.fixed(agent.as_bytes());
-                encoder.fixed(runtime_deployment.as_bytes());
-                encode_runtime_state(encoder, state);
-                encode_management_request(encoder, request);
-                encoder.option(authority, |encoder, value| {
-                    <AuthorityReceipt as CanonicalWire>::encode_body(value, encoder)
-                });
-                encoder.u64(*observed_slot);
-            }
-            RuntimeWork::Invoke {
-                context,
-                state,
-                invocation,
-                authorization,
-                observed_slot,
-            } => {
-                encoder.u8(1);
-                encode_runtime_execution_context(encoder, *context);
-                encode_runtime_state(encoder, state);
-                encode_invocation_work(encoder, invocation);
-                encode_invocation_authorization(encoder, authorization);
-                encoder.u64(*observed_slot);
-            }
-            RuntimeWork::Resume {
-                context,
-                state,
-                resume,
-            } => {
-                encoder.u8(2);
-                encode_runtime_execution_context(encoder, *context);
-                encode_runtime_state(encoder, state);
-                encode_resume_work(encoder, resume);
-            }
-            RuntimeWork::Acknowledge {
-                context,
-                state,
-                invocation,
-                authorization,
-            } => {
-                encoder.u8(3);
-                encode_runtime_execution_context(encoder, *context);
-                encode_runtime_state(encoder, state);
-                invocation.encode_body(encoder);
-                encode_invocation_authorization(encoder, authorization);
-            }
-            #[cfg(feature = "experimental-state-blocks")]
-            RuntimeWork::InspectInvocation {
-                context,
-                state,
-                invocation,
-                authorization,
-                observed_slot,
-            } => {
-                encoder.u8(4);
-                encode_runtime_execution_context(encoder, *context);
-                encode_runtime_state(encoder, state);
-                invocation.encode_body(encoder);
-                encode_invocation_authorization(encoder, authorization);
-                encoder.u64(*observed_slot);
-            }
-        }
+        encode_runtime_work_body(encoder, self, true);
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -4493,6 +4433,110 @@ impl CanonicalWire for RuntimeWork {
             .then_some(value)
             .ok_or(DecodeError::NonCanonical)
     }
+}
+
+fn encode_runtime_work_body(
+    encoder: &mut Encoder<'_>,
+    work: &RuntimeWork,
+    include_preimages: bool,
+) {
+    match work {
+        RuntimeWork::Manage {
+            context,
+            space,
+            agent,
+            runtime_deployment,
+            state,
+            request,
+            authority,
+            observed_slot,
+        } => {
+            encoder.u8(0);
+            encode_runtime_execution_context(encoder, *context);
+            encoder.fixed(space.as_bytes());
+            encoder.fixed(agent.as_bytes());
+            encoder.fixed(runtime_deployment.as_bytes());
+            encode_runtime_state(encoder, state);
+            encode_management_request(encoder, request);
+            encoder.option(authority, |encoder, value| {
+                <AuthorityReceipt as CanonicalWire>::encode_body(value, encoder)
+            });
+            encoder.u64(*observed_slot);
+        }
+        RuntimeWork::Invoke {
+            context,
+            state,
+            invocation,
+            authorization,
+            observed_slot,
+        } => {
+            encoder.u8(1);
+            encode_runtime_execution_context(encoder, *context);
+            encode_runtime_state(encoder, state);
+            encode_invocation_work_with_availability(encoder, invocation, include_preimages);
+            encode_invocation_authorization(encoder, authorization);
+            encoder.u64(*observed_slot);
+        }
+        RuntimeWork::Resume {
+            context,
+            state,
+            resume,
+        } => {
+            encoder.u8(2);
+            encode_runtime_execution_context(encoder, *context);
+            encode_runtime_state(encoder, state);
+            encode_resume_work_with_availability(encoder, resume, include_preimages);
+        }
+        RuntimeWork::Acknowledge {
+            context,
+            state,
+            invocation,
+            authorization,
+        } => {
+            encoder.u8(3);
+            encode_runtime_execution_context(encoder, *context);
+            encode_runtime_state(encoder, state);
+            invocation.encode_body(encoder);
+            encode_invocation_authorization(encoder, authorization);
+        }
+        #[cfg(feature = "experimental-state-blocks")]
+        RuntimeWork::InspectInvocation {
+            context,
+            state,
+            invocation,
+            authorization,
+            observed_slot,
+        } => {
+            encoder.u8(4);
+            encode_runtime_execution_context(encoder, *context);
+            encode_runtime_state(encoder, state);
+            invocation.encode_body(encoder);
+            encode_invocation_authorization(encoder, authorization);
+            encoder.u64(*observed_slot);
+        }
+    }
+}
+
+/// Commitment of one canonical [`RuntimeWork`] with every availability blob of
+/// an Invoke or Resume replaced by its [`BlobRef`].
+///
+/// This binds exactly the bytes the canonical work binds, without hashing the
+/// preimages again: the work's decoder accepts an Invoke or Resume only after
+/// `availability_valid` has checked every blob's bytes against its reference
+/// (`RuntimeBlob::validate`, hash and length), and a reference is
+/// `BLAKE2b-256("vos/blob" || bytes)` plus the length. Two decodable works with
+/// the same commitment therefore differ in no byte, unless BLAKE2b collides.
+/// The reference form keeps the frame's magic and ABI identity, every other
+/// field and every length, so it is itself an unambiguous encoding.
+///
+/// Callers must pass a value obtained from [`CanonicalWire::decode`] (or one
+/// whose availability they validated); the function does not hash preimages.
+pub fn runtime_work_reference_commitment(work: &RuntimeWork) -> Hash {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&<RuntimeWork as CanonicalWire>::MAGIC);
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_runtime_work_body(&mut Encoder(&mut bytes), work, false);
+    Hash::digest(b"vos/agent/runtime-work-by-reference/v1", &[&bytes])
 }
 
 fn encode_lifecycle_debt(encoder: &mut Encoder<'_>, value: ActorLifecycleDebt) {

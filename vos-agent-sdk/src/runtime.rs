@@ -1216,6 +1216,49 @@ pub fn runtime_transition_public_io(canonical_work: &[u8], canonical_transition:
     )
 }
 
+/// Public-I/O commitment for one canonical runtime execution, with the work
+/// committed by reference ([`crate::wire::runtime_work_reference_commitment`]).
+///
+/// It binds the same bytes as [`runtime_transition_public_io`]: the work's
+/// decoder authenticates every availability preimage against its reference
+/// before the runtime executes, so the reference form identifies the complete
+/// canonical work. The guest no longer hashes caller-sized availability a
+/// second time to produce it. The domain differs from the byte form's, so the
+/// two definitions can never be confused for one another.
+pub fn runtime_transition_public_io_by_reference(
+    work_by_reference: Hash,
+    canonical_transition: &[u8],
+) -> Hash {
+    let transition = Hash::digest(
+        b"vos/agent/runtime-public-io/transition/v1",
+        &[canonical_transition],
+    );
+    Hash::digest(
+        b"vos/agent/runtime-public-io/v2",
+        &[
+            crate::RUNTIME_ABI_ID.as_bytes(),
+            work_by_reference.as_bytes(),
+            transition.as_bytes(),
+        ],
+    )
+}
+
+/// Native counterpart of the guest's by-reference public I/O, for verifiers
+/// and replicas holding the exact canonical work bytes. It decodes the work,
+/// which authenticates every availability preimage, and refuses a work whose
+/// blob bytes do not match their references, exactly as the guest traps.
+pub fn runtime_transition_public_io_of_work(
+    canonical_work: &[u8],
+    canonical_transition: &[u8],
+) -> Result<Hash, crate::wire::WireError> {
+    use crate::wire::CanonicalWire as _;
+    let work = RuntimeWork::decode(canonical_work)?;
+    Ok(runtime_transition_public_io_by_reference(
+        crate::wire::runtime_work_reference_commitment(&work),
+        canonical_transition,
+    ))
+}
+
 /// Host-independent contract implemented by every custom AgentRuntime.
 pub trait AgentRuntime {
     fn capabilities(&self) -> RuntimeCapabilities;

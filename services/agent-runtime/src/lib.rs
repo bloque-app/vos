@@ -33,14 +33,22 @@ mod guest {
         // SAFETY: the standard PVM loader maps the complete argument window
         // read-only and supplies its base/length in a0/a1.
         let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
+        // The standard build commits its public I/O to the work by reference:
+        // the decoder has authenticated every availability preimage, so the
+        // reference form binds the same bytes without hashing them again.
         #[cfg(not(feature = "experimental-state-blocks"))]
-        let output = vos::agent::wire::apply_standard_runtime_input(input)
-            .unwrap_or_else(|_| fail_closed())
-            .encode()
-            .unwrap_or_else(|_| fail_closed());
+        let (output, public_io) = {
+            let (transition, work) = vos::agent::wire::apply_standard_runtime_input_committed(input)
+                .unwrap_or_else(|_| fail_closed());
+            let output = transition.encode().unwrap_or_else(|_| fail_closed());
+            let public_io =
+                vos::agent_sdk::runtime_transition_public_io_by_reference(work, &output);
+            (output, public_io)
+        };
         #[cfg(feature = "experimental-state-blocks")]
         let output = vos::agent::wire::apply_standard_external_runtime_input(input)
             .unwrap_or_else(|_| fail_closed());
+        #[cfg(feature = "experimental-state-blocks")]
         let public_io = vos::agent_sdk::runtime_transition_public_io(input, &output);
         halt_with_output_bound(&output, public_io.as_bytes())
     }

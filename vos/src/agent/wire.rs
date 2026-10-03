@@ -462,6 +462,55 @@ const STANDARD_CLEAN_ACTOR_PACKAGES_MAGIC: [u8; 4] = *b"SCAP";
 const STANDARD_CLEAN_ACTOR_INSTALLATIONS_MAGIC: [u8; 4] = *b"SCI2";
 const STANDARD_CLEAN_INVOCATION_ERRORS_MAGIC: [u8; 4] = *b"SCER";
 const STANDARD_SEQUENCED_RETIREMENT_MAGIC: [u8; 4] = *b"SQRT";
+const STANDARD_PROGRAM_BINDINGS_MAGIC: [u8; 4] = *b"SPB1";
+
+/// Optional last section of the control component: the guest-verified
+/// program bindings. Absent while empty, so an image without bindings encodes
+/// exactly as before the section existed.
+fn encode_program_bindings(encoder: &mut Encoder<'_>, state: &StandardRuntimeState) {
+    if state.program_bindings.is_empty() {
+        return;
+    }
+    encoder.0.extend_from_slice(&STANDARD_PROGRAM_BINDINGS_MAGIC);
+    encoder.u16(1);
+    encoder.list(&state.program_bindings, |encoder, binding| {
+        encoder.fixed(&binding.actor.0);
+        encoder.fixed(&binding.program.0);
+        encoder.fixed(&binding.reference.hash.0);
+        encoder.u64(binding.reference.len);
+    });
+}
+
+fn decode_program_bindings(
+    decoder: &mut Decoder<'_>,
+) -> Result<Vec<super::standard::StandardProgramBinding>, DecodeError> {
+    if decoder.exhausted() {
+        return Ok(Vec::new());
+    }
+    if decoder.take(4)? != STANDARD_PROGRAM_BINDINGS_MAGIC || decoder.u16()? != 1 {
+        return Err(DecodeError::NonCanonical);
+    }
+    let bindings = decode_bounded_list(
+        decoder,
+        super::contract::STANDARD_MAX_ACTORS as usize,
+        |decoder| {
+            Ok(super::standard::StandardProgramBinding {
+                actor: ActorId(decoder.fixed()?),
+                program: ProgramId(decoder.fixed()?),
+                reference: crate::agent_sdk::BlobRef {
+                    hash: crate::agent_sdk::Hash(decoder.fixed()?),
+                    len: decoder.u64()?,
+                },
+            })
+        },
+    )?;
+    // Present only when nonempty; ordering and membership are checked when
+    // the runtime is restored.
+    if bindings.is_empty() {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(bindings)
+}
 
 /// Optional trailing section of one result component: its sequenced
 /// retirement watermark. Absent while zero, so a component that never
@@ -488,14 +537,17 @@ fn decode_result_component_tail(
     decoder: &mut Decoder<'_>,
     storage: super::InvocationResultStorage,
 ) -> Result<(Vec<super::standard::StandardCleanInvocationError>, u64), DecodeError> {
-    let errors = if decoder.peek(STANDARD_SEQUENCED_RETIREMENT_MAGIC.len())
-        == Some(&STANDARD_SEQUENCED_RETIREMENT_MAGIC[..])
+    let next_is = |decoder: &Decoder<'_>, magic: &[u8; 4]| {
+        decoder.peek(magic.len()) == Some(&magic[..])
+    };
+    let errors = if next_is(decoder, &STANDARD_SEQUENCED_RETIREMENT_MAGIC)
+        || next_is(decoder, &STANDARD_PROGRAM_BINDINGS_MAGIC)
     {
         Vec::new()
     } else {
         decode_clean_invocation_errors(decoder, storage)?
     };
-    if decoder.exhausted() {
+    if decoder.exhausted() || next_is(decoder, &STANDARD_PROGRAM_BINDINGS_MAGIC) {
         return Ok((errors, 0));
     }
     if decoder.take(4)? != STANDARD_SEQUENCED_RETIREMENT_MAGIC || decoder.u16()? != 1 {
@@ -822,6 +874,7 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
     }
     encode_clean_invocation_errors(&mut encoder, state, super::InvocationResultStorage::Control);
     encode_sequenced_retirement(&mut encoder, state, super::InvocationResultStorage::Control);
+    encode_program_bindings(&mut encoder, state);
     RuntimeState {
         control,
         linear: encode_standard_lane(state, StateLane::Linear),
@@ -1292,6 +1345,7 @@ fn decode_standard_runtime_components(
     };
     let (mut clean_invocation_errors, control_retired_through) =
         decode_result_component_tail(&mut decoder, super::InvocationResultStorage::Control)?;
+    let program_bindings = decode_program_bindings(&mut decoder)?;
     if !decoder.exhausted() {
         return Err(DecodeError::TrailingBytes);
     }
@@ -1388,6 +1442,7 @@ fn decode_standard_runtime_components(
         authority_slot_high_water,
         authority_sequence_high_water,
         authority_dispositions,
+        program_bindings,
     };
     Ok(state)
 }
@@ -2301,6 +2356,29 @@ pub fn apply_standard_runtime_input(
 
     let work =
         crate::agent_sdk::RuntimeWork::decode(input).map_err(|_| DecodeError::NonCanonical)?;
+    apply_decoded_standard_runtime_work(work)
+}
+
+/// [`apply_standard_runtime_input`], also returning the work's by-reference
+/// commitment ([`crate::agent_sdk::wire::runtime_work_reference_commitment`])
+/// for the public I/O. The commitment is taken from the decoded work, whose
+/// availability the decoder has authenticated, before execution consumes it.
+#[cfg(feature = "pvm")]
+pub fn apply_standard_runtime_input_committed(
+    input: &[u8],
+) -> Result<(crate::agent_sdk::RuntimeTransition, crate::agent_sdk::Hash), DecodeError> {
+    use crate::agent_sdk::wire::CanonicalWire as _;
+
+    let work =
+        crate::agent_sdk::RuntimeWork::decode(input).map_err(|_| DecodeError::NonCanonical)?;
+    let commitment = crate::agent_sdk::wire::runtime_work_reference_commitment(&work);
+    Ok((apply_decoded_standard_runtime_work(work)?, commitment))
+}
+
+#[cfg(feature = "pvm")]
+fn apply_decoded_standard_runtime_work(
+    work: crate::agent_sdk::RuntimeWork,
+) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
     if !work.execution_context().is_direct() {
         #[cfg(all(feature = "agent-runtime", target_arch = "riscv64"))]
         return apply_proof_host_attested_standard_runtime_work(work);
@@ -3448,7 +3526,16 @@ fn apply_clean_invoke_restored(
         }
         Ok(None) => {}
     }
-    match runtime.recover_clean_execution(&work, &authorization, observed_slot) {
+    let recovered_execution = if decoded_work {
+        runtime.recover_validated_clean_execution(
+            ValidatedInvocationWork(&work),
+            &authorization,
+            observed_slot,
+        )
+    } else {
+        runtime.recover_clean_execution(&work, &authorization, observed_slot)
+    };
+    match recovered_execution {
         Ok(Some(reply)) => {
             let mut result = Ok(reply);
             let successor = finish_standard_execution_candidate(
@@ -3471,7 +3558,12 @@ fn apply_clean_invoke_restored(
         }
         Ok(None) => {}
     }
-    let resolved = match runtime.resolve_clean_invocation_for_execution(&work) {
+    let resolved = if decoded_work {
+        runtime.resolve_validated_clean_invocation_for_execution(ValidatedInvocationWork(&work))
+    } else {
+        runtime.resolve_clean_invocation_for_execution(&work)
+    };
+    let resolved = match resolved {
         Ok(resolved) => resolved,
         Err(error) if error.is_durable_exact_outcome() => {
             if let Err(slot_error) =
@@ -3513,6 +3605,14 @@ fn apply_clean_invoke_restored(
             ));
         }
     };
+    if resolved.work_validated()
+        && let Some(reference) = resolved.program_reference()
+    {
+        // The guest has hashed (or earlier bound) exactly these authenticated
+        // bytes to the actor's current ProgramId; later invocations identify
+        // the program by this verified reference without hashing it again.
+        runtime.bind_program(resolved.actor_id(), reference);
+    }
     let (invocation, actor_pvm, actor_schema, actor_policies, installation_data) = resolved.parts();
     let (mut result, commit_candidate) =
         match runtime.recover_execution(&invocation, observed_slot) {
