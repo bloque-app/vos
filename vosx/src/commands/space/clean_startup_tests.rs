@@ -2273,8 +2273,7 @@ fn candidate_shared_agent_create_install_invoke_reopens_without_test_finality() 
     use vos::agent::sdk::wire::CanonicalWire as _;
     use vos::agent::sdk::{
         DeploymentId, InvocationAuthorization, InvocationOrigin, InvocationRoleClaims,
-        InvocationStatus, MethodMode, ProgramId, PublicPreflight, RuntimeExecutionContext,
-        RuntimeOutcome,
+        InvocationStatus, MethodMode, ProgramId, RuntimeExecutionContext, RuntimeOutcome,
     };
     use vos::agent::supervisor::AgentRouteKey;
     use vos::agent::supervisor_adapters::{
@@ -2504,10 +2503,19 @@ fn candidate_shared_agent_create_install_invoke_reopens_without_test_finality() 
         after: None,
         limit: 1,
     };
+    // Managed invocation exactly as `invoke-local` does it, without HTTP:
+    // credential projection, signed AOC5, native clock capture, Authority
+    // issuance, then delivery and acknowledgement with the issued receipt.
+    // An unsigned PublicPreflight binds the preparation slot exactly, so it
+    // cannot survive the candidate clock, which advances on every read.
     let invoke = |vos_node: &VosNode, seed: u8| -> Vec<u8> {
+        use vos::agent::clean_bootstrap::NativeAuthorityOperationDecision;
+        use vos::agent::production_owner::AuthorityProjectionQueryAuthenticator as _;
+        use vos::agent::sdk::authority::AuthorityProjectionSelector;
         let supervisor = vos_node
             .clean_agent_supervisor()
             .expect("Shared routes must be published");
+        let handle = vos_node.ingress_handle();
         let key = AgentRouteKey::new(space, agent, actor).unwrap();
         let mut message = vec![vos::value::TAG_DYNAMIC];
         message.extend_from_slice(
@@ -2520,7 +2528,11 @@ fn candidate_shared_agent_create_install_invoke_reopens_without_test_finality() 
             AgentInvocationIntent::new(
                 InvocationId([seed; 32]),
                 MethodMode::Query,
-                InvocationOrigin::anonymous(),
+                InvocationOrigin {
+                    principal: Some(owner),
+                    credential: Some(CredentialId::of_public_key(&public)),
+                    ..InvocationOrigin::anonymous()
+                },
                 InvocationRoleClaims::none(),
                 message,
                 vos::agent::execution::MAX_EXECUTION_GAS,
@@ -2532,20 +2544,46 @@ fn candidate_shared_agent_create_install_invoke_reopens_without_test_finality() 
         let response = prepare_targeted_invocation(&supervisor, &preparation).unwrap();
         let prepared = response.for_request(&preparation).unwrap();
         assert_eq!(prepared.profile(), AgentProfile::Shared);
+        let query = OperatorAuthorityProjectionAuthenticator::new(operator.clone())
+            .unwrap()
+            .authenticate(authority, AuthorityProjectionSelector::Credential)
+            .unwrap();
+        let credential = handle.query_clean_credential(query).unwrap();
+        let now = prepared
+            .observed_slot()
+            .max(inputs.clock.load(Ordering::Acquire));
+        let signed = crate::commands::space::operation_authorization::preparation::prepare(
+            &operator,
+            authority,
+            &descriptor,
+            &credential,
+            prepared,
+            crate::commands::space::operation_authorization::preparation::Timing {
+                authorization_slot: now,
+                issued_at: now,
+                valid_from: now.saturating_sub(60),
+                expires_at: now + 100_000,
+            },
+        )
+        .unwrap();
+        let timeout = Duration::from_secs(120);
+        let captured = handle
+            .prepare_clean_agent_operation(signed.call().clone())
+            .unwrap()
+            .recv_timeout(timeout)
+            .unwrap()
+            .unwrap();
+        let NativeAuthorityOperationDecision::Issued(issued) = handle
+            .submit_clean_agent_operation(captured)
+            .unwrap()
+            .recv_timeout(timeout)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("operator Query on its own Shared Agent must be authorized");
+        };
         let work = prepared.work().clone();
-        // The host's own method policy decides whether an unsigned preflight
-        // is admissible; never construct one for a non-Public method.
-        let preflight = prepared.public_preflight().unwrap_or_else(|| {
-            panic!(
-                "catalog page is not a Public method: {:?}",
-                prepared.selected_method()
-            )
-        });
-        assert_eq!(
-            preflight,
-            PublicPreflight::for_work(&work, prepared.observed_slot())
-        );
-        let authorization = InvocationAuthorization::PublicPreflight(preflight);
+        let authorization = InvocationAuthorization::AuthorityReceipt(issued.receipt);
         let request = AgentInvocationRequest::new(
             RuntimeExecutionContext::Direct,
             work.clone(),
@@ -2557,14 +2595,14 @@ fn candidate_shared_agent_create_install_invoke_reopens_without_test_finality() 
             supervisor.snapshot(key).unwrap(),
             &request.encode().unwrap(),
         )
-        .unwrap_or_else(|error| panic!("public Shared Query dispatch failed: {error:?}"));
+        .unwrap_or_else(|error| panic!("Shared Query dispatch failed: {error:?}"));
         let reply = match response {
             AgentInvocationResponse::Direct {
                 outcome: RuntimeOutcome::Completed(Ok(reply)),
                 ..
             } => reply,
             other => panic!(
-                "public Shared Query must complete directly; mode={:?} actor={:?} response={other:?}",
+                "authorized Shared Query must complete directly; mode={:?} actor={:?} response={other:?}",
                 work.mode, work.actor
             ),
         };
