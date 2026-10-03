@@ -4755,7 +4755,22 @@ mod tests {
                 .unwrap(),
             completed
         );
-        assert_eq!(standby.agents[&agent].driver.image(), &source_image);
+        // A later-slot retry records the newer authority slot in the Linear
+        // lane revision (a new image revision with the same outcome). The
+        // untouched source root, given the identical retry, must land on the
+        // byte-identical image: import introduced no divergence.
+        let retried_image = standby.agents[&agent].driver.image().clone();
+        let mut source =
+            LocalAgentHost::open(&source_root, space(), node(), trust.clone()).unwrap();
+        assert_eq!(source.agents[&agent].driver.image(), &source_image);
+        assert_eq!(
+            source
+                .invoke(agent, work.clone(), authorization.clone())
+                .unwrap(),
+            completed
+        );
+        assert_eq!(source.agents[&agent].driver.image(), &retried_image);
+        drop(source);
         assert!(matches!(
             standby
                 .acknowledge_sdk(agent, work.clone(), authorization.clone())
@@ -4784,12 +4799,13 @@ mod tests {
             continued
         );
         // The stale bundle cannot overwrite the advanced standby slot.
+        let advanced_image = standby.agents[&agent].driver.image().clone();
         let advanced = root_tree(&standby_root);
         assert_eq!(
             standby.import_agent(&bundle),
             Err(LocalAgentHostError::AlreadyExists)
         );
         assert_eq!(root_tree(&standby_root), advanced);
-        assert_eq!(standby.agents[&agent].driver.image(), &continued_image);
+        assert_eq!(standby.agents[&agent].driver.image(), &advanced_image);
     }
 }
