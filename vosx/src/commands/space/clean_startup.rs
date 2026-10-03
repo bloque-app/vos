@@ -618,23 +618,186 @@ fn read_certified_bootstrap_bundle(
     .map_err(Into::into)
 }
 
+/// Directory, under the root node's Space data directory, that retains the
+/// root's genesis certification for one prepared fixed-roster bundle.
+pub(crate) const FIXED_ROSTER_CERTIFICATION_DIRECTORY: &str = "system-roster-certification";
+const NODE_ENROLLMENT_MAGIC: &[u8; 4] = b"VNE1";
+/// Exact size of an exported node enrollment: magic, Space, owner principal,
+/// transport key, encryption key and transport signature.
+pub(crate) const NODE_ENROLLMENT_FILE_BYTES: usize = 4 + 4 * 32 + 64;
+
+/// This node's signed enrollment for the Space whose root is `operator`.
+/// The joining node sends it to the root, which certifies the fixed roster.
+pub(crate) fn local_node_enrollment(
+    space: [u8; 32],
+    operator: &Keypair,
+    daemon: &Keypair,
+) -> anyhow::Result<vos::agent::sdk::private::NodeEncryptionEnrollment> {
+    require_ed25519(operator, "space root")?;
+    require_ed25519(daemon, "node transport")?;
+    let space = SpaceId(space);
+    let owner = PrincipalId::of_public_key(&raw_public_key(operator)?);
+    let enrollment = sign_node_encryption_enrollment(
+        daemon,
+        space,
+        owner,
+        derive_node_encryption_public(daemon, space)?,
+    )?;
+    anyhow::ensure!(
+        enrollment.node == node_id_from_authenticated_peer(&daemon.public().to_peer_id()),
+        "node enrollment does not bind the authenticated transport identity"
+    );
+    Ok(enrollment)
+}
+
+pub(crate) fn encode_node_enrollment(
+    enrollment: &vos::agent::sdk::private::NodeEncryptionEnrollment,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(NODE_ENROLLMENT_FILE_BYTES);
+    bytes.extend_from_slice(NODE_ENROLLMENT_MAGIC);
+    bytes.extend_from_slice(&enrollment.space.0);
+    bytes.extend_from_slice(&enrollment.principal.0);
+    bytes.extend_from_slice(&enrollment.transport_public_key);
+    bytes.extend_from_slice(&enrollment.encryption_public_key);
+    bytes.extend_from_slice(&enrollment.transport_signature);
+    bytes
+}
+
+/// Strict inverse of [`encode_node_enrollment`]. Every redundant identity
+/// field is re-derived from the transport key and the signature is verified
+/// before the enrollment can enter a roster.
+pub(crate) fn decode_node_enrollment(
+    bytes: &[u8],
+) -> anyhow::Result<vos::agent::sdk::private::NodeEncryptionEnrollment> {
+    use vos::agent::private_crypto::StrictNodeEncryptionEnrollmentVerifier;
+    anyhow::ensure!(
+        bytes.len() == NODE_ENROLLMENT_FILE_BYTES && bytes.starts_with(NODE_ENROLLMENT_MAGIC),
+        "node enrollment must be exactly {NODE_ENROLLMENT_FILE_BYTES} bytes of VNE1"
+    );
+    let field = |index: usize| -> [u8; 32] {
+        let start = NODE_ENROLLMENT_MAGIC.len() + index * 32;
+        bytes[start..start + 32].try_into().expect("bounded field")
+    };
+    let signature: [u8; 64] = bytes[NODE_ENROLLMENT_FILE_BYTES - 64..]
+        .try_into()
+        .expect("bounded signature");
+    let enrollment = vos::agent::sdk::private::NodeEncryptionEnrollment::from_keys(
+        SpaceId(field(0)),
+        PrincipalId(field(1)),
+        field(2),
+        field(3),
+        signature,
+    );
+    anyhow::ensure!(
+        enrollment.verify_with(&StrictNodeEncryptionEnrollmentVerifier),
+        "node enrollment has an invalid shape or transport signature"
+    );
+    Ok(enrollment)
+}
+
+/// Certify one common fixed-roster bootstrap bundle on the Space root node.
+///
+/// `enrollments` must hold exactly three distinct signed enrollments for this
+/// Space and root, including this node's own. The root certification is kept
+/// under [`FIXED_ROSTER_CERTIFICATION_DIRECTORY`], apart from the live system
+/// Agent stores, so preparing the bundle does not start this node. Every
+/// member (this node included) then starts once with the returned bytes as
+/// its `system_bootstrap_bundle`.
+pub(crate) fn prepare_fixed_roster_bundle(
+    data_dir: &Path,
+    space_bytes: [u8; 32],
+    operator: &Keypair,
+    daemon: &Keypair,
+    local_storage: super::local_config::LocalAgentStorage,
+    enrollments: &[vos::agent::sdk::private::NodeEncryptionEnrollment],
+    #[cfg(test)] test_inputs: Option<&StartupTestInputs>,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        enrollments.len() == 3,
+        "a fixed roster bundle requires exactly three node enrollments"
+    );
+    let space = SpaceId(space_bytes);
+    let local = local_node_enrollment(space_bytes, operator, daemon)?;
+    anyhow::ensure!(
+        enrollments.contains(&local),
+        "the root node's own enrollment must be part of the roster"
+    );
+    let certification = data_dir.join(FIXED_ROSTER_CERTIFICATION_DIRECTORY);
+    anyhow::ensure!(
+        std::fs::symlink_metadata(&certification)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        "a fixed roster was already certified under {}; reuse its bundle",
+        certification.display()
+    );
+    let operator_public = raw_public_key(operator)?;
+    let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
+    let authority = crate::bundled::root_signed_actor_package(
+        crate::bundled::system_authority_package_template_for_storage(local_storage)?,
+        SYSTEM_AUTHORITY_NAME,
+        operator,
+    )?;
+    let catalog = crate::bundled::root_signed_actor_package(
+        crate::bundled::system_catalog_package_template(),
+        SYSTEM_CATALOG_NAME,
+        operator,
+    )?;
+    #[cfg(test)]
+    let (runtime, authority, catalog) =
+        test_inputs.map_or((runtime, authority, catalog), |inputs| {
+            (
+                inputs.runtime.clone(),
+                inputs.authority.clone(),
+                inputs.catalog.clone(),
+            )
+        });
+    let materials = SystemBootstrapMaterials::new(
+        space,
+        operator_public,
+        local.node,
+        runtime,
+        authority,
+        catalog,
+        enrollments,
+    )?;
+    let target = materials.authority_target();
+    let (_, _, _, genesis) =
+        CleanSystemAgentFileStores::open_or_create(&certification)?.into_production_parts();
+    let archive = CleanSystemAgentGenesisArchive::new(
+        genesis,
+        HostSpaceId(space_bytes),
+        HostAgentId(target.system_agent.0),
+        HostNodeId(local.node.0),
+        HostHash(target.binding.commitment().0),
+        operator.clone(),
+    )?;
+    let slot = system_logical_slot()?;
+    let trust = Arc::new(SystemAgentTrust::new(
+        slot,
+        HostSpaceId(space_bytes),
+        host_authority_binding(target.system_agent, target.binding),
+    ));
+    let merge = Arc::new(
+        Ed25519NodeMergeAuthenticator::new(daemon.clone())
+            .map_err(|error| anyhow::anyhow!("construct roster merge signer: {error:?}"))?,
+    );
+    let prepared = materials.prepare(
+        operator,
+        slot,
+        &mut |root, proposal: &_, catalog: &_| archive.certify_fresh(root, proposal, catalog),
+        trust,
+        merge,
+    )?;
+    prepared
+        .encode_import()
+        .map_err(|error| anyhow::anyhow!("encode fixed roster bundle: {error:?}"))
+}
+
 #[cfg(test)]
-struct StartupTestInputs {
+pub(crate) struct StartupTestInputs {
     runtime: vos::agent::package_admission::AdmittedRuntimePackage,
     authority: AdmittedActorPackage,
     catalog: AdmittedActorPackage,
     clock: Arc<AtomicU64>,
-}
-
-fn validate_production_bootstrap_roster(
-    plan: &vos::agent::clean_bootstrap::AuthorizedCleanSystemAgentBootstrap,
-    allow_candidate_roster: bool,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        allow_candidate_roster || plan.pins().replicas().members().len() == 1,
-        "public startup requires singleton bootstrap until signed cluster configuration is integrated"
-    );
-    Ok(())
 }
 
 fn open_clean_system_lifecycle_with_inputs(
@@ -648,38 +811,9 @@ fn open_clean_system_lifecycle_with_inputs(
     certified_inputs: Option<&PreparedCleanSystemAgentBootstrap>,
     #[cfg(test)] test_inputs: Option<&StartupTestInputs>,
 ) -> anyhow::Result<(vos::agent::sdk::NodeId, CleanProductionLifecycle)> {
-    open_clean_system_lifecycle_with_roster_policy(
-        network,
-        data_dir,
-        space_bytes,
-        operator,
-        daemon,
-        local_storage,
-        host_lock,
-        certified_inputs,
-        cfg!(test),
-        #[cfg(test)]
-        test_inputs,
-    )
-}
-
-fn open_clean_system_lifecycle_with_roster_policy(
-    network: Arc<vos::network::Network>,
-    data_dir: &Path,
-    space_bytes: [u8; 32],
-    operator: &Keypair,
-    daemon: &Keypair,
-    local_storage: super::local_config::LocalAgentStorage,
-    host_lock: &Path,
-    certified_inputs: Option<&PreparedCleanSystemAgentBootstrap>,
-    allow_candidate_roster: bool,
-    #[cfg(test)] test_inputs: Option<&StartupTestInputs>,
-) -> anyhow::Result<(vos::agent::sdk::NodeId, CleanProductionLifecycle)> {
-    // Reject unsupported incoming placement before even creating control
-    // stores. Candidate multi-voter fixtures opt into a different test build.
-    if let Some(inputs) = certified_inputs {
-        validate_production_bootstrap_roster(inputs.plan(), allow_candidate_roster)?;
-    }
+    // A one- or three-node roster is accepted only as a root-certified common
+    // bundle (`read_certified_bootstrap_bundle`) or as the exact plan an
+    // earlier certified startup persisted; no ambient roster is constructed.
     super::local_config::validate_local_storage_roots(data_dir, local_storage)?;
     let startup_started = std::time::Instant::now();
     let report_phase = |phase: &'static str| {
@@ -716,9 +850,6 @@ fn open_clean_system_lifecycle_with_roster_policy(
                 .map_err(|error| anyhow::anyhow!("invalid persisted bootstrap plan: {error:?}"))
         })
         .transpose()?;
-    if let Some(plan) = &stored_plan {
-        validate_production_bootstrap_roster(plan, allow_candidate_roster)?;
-    }
 
     let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
     let authority_package = crate::bundled::root_signed_actor_package(

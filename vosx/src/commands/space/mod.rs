@@ -55,6 +55,8 @@ pub mod op_sign;
 #[cfg(target_os = "linux")]
 mod operation_authorization;
 pub mod reconcile;
+#[cfg(target_os = "linux")]
+pub mod roster;
 mod space_lock;
 pub mod up;
 pub mod verify;
@@ -161,6 +163,39 @@ pub enum SpaceCommand {
         #[arg(long, value_name = "DIR")]
         data_dir: Option<PathBuf>,
     },
+    /// Lay out a Space created on another machine, to start it as a roster node.
+    #[cfg(target_os = "linux")]
+    Join {
+        /// Space id (full hex) from the Space root.
+        space: String,
+        #[arg(long)]
+        name: String,
+        /// Peer multiaddr to sync the registry from. Repeatable.
+        #[arg(long, value_name = "MULTIADDR", required = true)]
+        bootnode: Vec<String>,
+        #[arg(long, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+    },
+    /// Write this node's signed enrollment for the Space root to certify.
+    #[cfg(target_os = "linux")]
+    EnrollNode {
+        space: String,
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
+    /// On the Space root: certify a three-node system bootstrap bundle.
+    #[cfg(target_os = "linux")]
+    PrepareRoster {
+        space: String,
+        /// Signed node enrollment, including the root node's own. Give three.
+        #[arg(long, value_name = "FILE", required = true)]
+        enrollment: Vec<PathBuf>,
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
+    },
+    /// Adopt a certified roster bundle for this node's first system-Agent start.
+    #[cfg(target_os = "linux")]
+    UseRoster { space: String, bundle: PathBuf },
     /// List spaces in the local index.
     List,
     /// Show local details for a space.
@@ -278,6 +313,31 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             registry,
             data_dir,
         }),
+        #[cfg(target_os = "linux")]
+        SpaceCommand::Join {
+            space,
+            name,
+            bootnode,
+            data_dir,
+        } => {
+            let data_dir = roster::join(&space, &name, &bootnode, data_dir)?;
+            println!("joined space {space} at {}", data_dir.display());
+            Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        SpaceCommand::EnrollNode { space, out } => {
+            let path = roster::enroll_node(&space, out)?;
+            println!("enrollment written to {}", path.display());
+            Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        SpaceCommand::PrepareRoster {
+            space,
+            enrollment,
+            out,
+        } => roster::prepare_roster(&space, &enrollment, &out),
+        #[cfg(target_os = "linux")]
+        SpaceCommand::UseRoster { space, bundle } => roster::use_roster(&space, &bundle),
         SpaceCommand::List => list::run(),
         SpaceCommand::Info { space } => info::run(&space),
         SpaceCommand::Up {

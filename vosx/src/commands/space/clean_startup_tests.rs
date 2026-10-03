@@ -470,13 +470,37 @@ enum FixedRosterStage {
     Owners,
     Participants,
     Routes,
-    ProductionGate,
+    CliRoutes,
 }
 
 #[test]
-#[ignore = "requires AUTHORITY_CANDIDATE_ELF; production roster rejection before writes and singleton retry"]
-fn candidate_production_roster_gate_preserves_fresh_root_for_singleton_retry() {
-    check_fixed_roster_preparation(FixedRosterStage::ProductionGate);
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF and loopback; CLI enrollments and root-certified bundle start three production owners"]
+fn candidate_fixed_roster_cli_bundle_starts_production_routes() {
+    check_fixed_roster_preparation(FixedRosterStage::CliRoutes);
+}
+
+#[test]
+fn node_enrollment_file_round_trips_and_refuses_tampering() {
+    let operator = Keypair::ed25519_from_bytes([0x61; 32]).unwrap();
+    let daemon = Keypair::ed25519_from_bytes([0x62; 32]).unwrap();
+    let space = [0x63; 32];
+    let enrollment = local_node_enrollment(space, &operator, &daemon).unwrap();
+    assert_eq!(
+        enrollment.principal,
+        PrincipalId::of_public_key(&raw_public_key(&operator).unwrap())
+    );
+    let bytes = encode_node_enrollment(&enrollment);
+    assert_eq!(bytes.len(), NODE_ENROLLMENT_FILE_BYTES);
+    assert_eq!(decode_node_enrollment(&bytes).unwrap(), enrollment);
+    for index in [0, 4, 36, 68, 100, NODE_ENROLLMENT_FILE_BYTES - 1] {
+        let mut tampered = bytes.clone();
+        tampered[index] ^= 1;
+        assert!(decode_node_enrollment(&tampered).is_err(), "byte {index}");
+    }
+    assert!(decode_node_enrollment(&bytes[..bytes.len() - 1]).is_err());
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert!(decode_node_enrollment(&longer).is_err());
 }
 
 fn check_fixed_roster_preparation(stage: FixedRosterStage) {
@@ -584,58 +608,6 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
     let published = journal_files(&certificate_path);
     let bundle = scratch.0.join("common.bundle");
     std::fs::write(&bundle, prepared.encode_import().unwrap()).unwrap();
-    if stage == FixedRosterStage::ProductionGate {
-        let data = scratch.0.join("rejected-import");
-        drop(crate::commands::space::clean_store::ensure_private_directory(&data).unwrap());
-        let daemon = &daemons[0];
-        let peer = daemon.public().to_peer_id();
-        let network = Arc::new(Network::start(NetworkConfig {
-            keypair: daemon.clone(),
-            local_prefix: derive_node_prefix(&peer),
-            listen: vec![],
-            bootstrap: vec![],
-            auto_dial_mdns: false,
-        }));
-        let local = read_certified_bootstrap_bundle(&bundle, space.0, &operator, daemon).unwrap();
-        let before = journal_files(&data);
-        let error = open_clean_system_lifecycle_with_roster_policy(
-            network.clone(),
-            &data,
-            space.0,
-            &operator,
-            daemon,
-            crate::commands::space::local_config::LocalAgentStorage::Image,
-            &data.join("host.lock"),
-            Some(&local),
-            false,
-            Some(&inputs),
-        )
-        .err()
-        .expect("production must reject a three-node import");
-        assert!(
-            error.to_string().contains("requires singleton bootstrap"),
-            "{error:#}"
-        );
-        assert_eq!(journal_files(&data), before);
-        assert_eq!(std::fs::read_dir(&data).unwrap().count(), 0);
-        // Removing the bundle is enough: the rejected input left no plan,
-        // archive, issuer, journal or host lock to poison supported startup.
-        let (_, owner) = open_clean_system_lifecycle_with_roster_policy(
-            network,
-            &data,
-            space.0,
-            &operator,
-            daemon,
-            crate::commands::space::local_config::LocalAgentStorage::Image,
-            &data.join("host.lock"),
-            None,
-            false,
-            Some(&inputs),
-        )
-        .unwrap();
-        drop(owner);
-        return;
-    }
     for (index, daemon) in daemons.iter().enumerate() {
         let local = read_certified_bootstrap_bundle(&bundle, space.0, &operator, daemon).unwrap();
         assert_eq!(local.plan().pins().node(), enrollments[index].node);
@@ -668,6 +640,74 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
         assert_eq!(journal_files(&certificate_path), published);
     }
     assert_eq!(certifications, 1);
+    if stage == FixedRosterStage::CliRoutes {
+        // Replace the in-test certification with the one `space enroll-node`
+        // and `space prepare-roster` produce: every enrollment crosses the
+        // VNE1 file format, and the root certifies under its own data dir.
+        let files: Vec<_> = daemons
+            .iter()
+            .map(|daemon| {
+                encode_node_enrollment(&local_node_enrollment(space.0, &operator, daemon).unwrap())
+            })
+            .collect();
+        let decoded: Vec<_> = files
+            .iter()
+            .map(|bytes| decode_node_enrollment(bytes).unwrap())
+            .collect();
+        assert_eq!(decoded, enrollments);
+        let root_data = scratch.0.join("root-data");
+        drop(crate::commands::space::clean_store::ensure_private_directory(&root_data).unwrap());
+        assert!(
+            prepare_fixed_roster_bundle(
+                &root_data,
+                space.0,
+                &operator,
+                &daemons[0],
+                crate::commands::space::local_config::LocalAgentStorage::Image,
+                &decoded[..2],
+                Some(&inputs),
+            )
+            .is_err(),
+            "a two-node roster must be refused"
+        );
+        assert!(
+            prepare_fixed_roster_bundle(
+                &root_data,
+                space.0,
+                &operator,
+                &daemons[1],
+                crate::commands::space::local_config::LocalAgentStorage::Image,
+                &[decoded[0], decoded[2], decoded[2]],
+                Some(&inputs),
+            )
+            .is_err(),
+            "the preparing node must be in the roster"
+        );
+        let cli_bundle = prepare_fixed_roster_bundle(
+            &root_data,
+            space.0,
+            &operator,
+            &daemons[0],
+            crate::commands::space::local_config::LocalAgentStorage::Image,
+            &decoded,
+            Some(&inputs),
+        )
+        .unwrap();
+        assert!(
+            prepare_fixed_roster_bundle(
+                &root_data,
+                space.0,
+                &operator,
+                &daemons[0],
+                crate::commands::space::local_config::LocalAgentStorage::Image,
+                &decoded,
+                Some(&inputs),
+            )
+            .is_err(),
+            "a second certification under the same root data dir must be refused"
+        );
+        std::fs::write(&bundle, cli_bundle).unwrap();
+    }
     if stage != FixedRosterStage::Bundle {
         let networks: Vec<_> = daemons
             .iter()
@@ -756,7 +796,9 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
             }
             if matches!(
                 stage,
-                FixedRosterStage::Participants | FixedRosterStage::Routes
+                FixedRosterStage::Participants
+                    | FixedRosterStage::Routes
+                    | FixedRosterStage::CliRoutes
             ) {
                 let nodes = std::thread::scope(|scope| {
                     let handles: Vec<_> = owners
@@ -801,7 +843,10 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                             .load(std::sync::atomic::Ordering::Acquire),
                         "replica {index} stopped during initial reconciliation"
                     );
-                    if stage == FixedRosterStage::Routes {
+                    if matches!(
+                        stage,
+                        FixedRosterStage::Routes | FixedRosterStage::CliRoutes
+                    ) {
                         assert!(
                             node.clean_agent_supervisor().is_some(),
                             "replica {index} routes not ready"
@@ -817,30 +862,6 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                 drop(nodes);
             } else {
                 drop(owners);
-            }
-            // At the restart boundary, production must reject the stored
-            // roster without importing or initializing another owner.
-            for (index, data) in data.iter().enumerate() {
-                let before = journal_files(data);
-                let error = open_clean_system_lifecycle_with_roster_policy(
-                    networks[index].clone(),
-                    data,
-                    space.0,
-                    &operator,
-                    &daemons[index],
-                    crate::commands::space::local_config::LocalAgentStorage::Image,
-                    &data.join("host.lock"),
-                    None,
-                    false,
-                    Some(&inputs),
-                )
-                .err()
-                .expect("production must reject the persisted roster");
-                assert!(
-                    error.to_string().contains("requires singleton bootstrap"),
-                    "{error:#}"
-                );
-                assert_eq!(journal_files(data), before);
             }
         }
     }

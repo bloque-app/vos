@@ -95,7 +95,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     require_boot_registry_handshake(vos::block_on(registry.protocol(&mut &node)))?;
     anchor_space_id(&node, &registry, space_id)?;
     reject_legacy_registry_rows(&node, &registry)?;
-    require_space_root(&node, &registry, &operator_keypair)?;
+    // A joined node has no registry genesis until its peers sync one; its
+    // root check then waits for that sync instead of failing closed early.
+    let root_pending = vos::block_on(registry.root(&mut &node))
+        .map_err(|error| anyhow::anyhow!("read immutable Space root: {error}"))?
+        .is_empty()
+        && !entry.bootnodes.is_empty();
+    if !root_pending {
+        require_space_root(&node, &registry, &operator_keypair)?;
+    }
 
     if !entry.hyperspace.is_empty() {
         let replication_id = derive_hyperspace_id(&entry.hyperspace);
@@ -108,6 +116,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
 
     node.attach_network(network);
+    if root_pending {
+        // Peer DAG nodes were already checked against this Space's genesis
+        // by the registry's node validator before they were merged.
+        wait_for_synced_space_root(&node, &registry, &operator_keypair)?;
+    }
     #[cfg(target_os = "linux")]
     super::clean_startup::start_clean_system_agent(
         &mut node,
@@ -164,7 +177,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_daemon_keypair(data_dir: &Path) -> anyhow::Result<libp2p::identity::Keypair> {
+pub(crate) fn load_daemon_keypair(data_dir: &Path) -> anyhow::Result<libp2p::identity::Keypair> {
     let key_path = data_dir.join("node.key");
     let bytes = crate::secure_file::read_owner_only_optional(&key_path, 4 * 1024)?
         .ok_or_else(|| anyhow::anyhow!("node identity does not exist: {}", key_path.display()))?;
@@ -251,6 +264,32 @@ fn require_space_root(
         );
     }
     Ok(())
+}
+
+/// Bound on how long a joined node waits for its bootnodes to deliver the
+/// registry genesis before the root check fails closed.
+const JOIN_REGISTRY_SYNC_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn wait_for_synced_space_root(
+    node: &VosNode,
+    registry: &RegistryRef,
+    operator: &libp2p::identity::Keypair,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + JOIN_REGISTRY_SYNC_WINDOW;
+    loop {
+        let root = vos::block_on(registry.root(&mut &*node))
+            .map_err(|error| anyhow::anyhow!("read immutable Space root: {error}"))?;
+        if !root.is_empty() {
+            return require_space_root(node, registry, operator);
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "registry genesis did not sync from the bootnodes within {}s",
+                JOIN_REGISTRY_SYNC_WINDOW.as_secs()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 }
 
 fn require_boot_registry_handshake(
