@@ -29,6 +29,18 @@ pub(super) enum Exercise {
     OverwrittenRegistration,
     ExpiredCustody,
     ExpiredContendedCustody,
+    SharedReplicaJoin,
+}
+
+#[test]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
+fn candidate_shared_replica_join_admits_generation_without_originator_proof() {
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true,
+        None,
+        false,
+        Some(Exercise::SharedReplicaJoin),
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1583,6 +1595,10 @@ pub(super) fn exercise(
         );
         return;
     }
+    if let Exercise::SharedReplicaJoin = exercise {
+        super::shared_replica::exercise(leader, owners, fixtures, networks);
+        return;
+    }
     if let Exercise::OverwrittenRegistration = exercise {
         exercise_overwritten_registration(leader, owners, fixtures, networks);
         return;
@@ -1637,6 +1653,7 @@ pub(super) fn exercise(
         Exercise::OverwrittenRegistration => unreachable!(),
         Exercise::ExpiredCustody => unreachable!(),
         Exercise::ExpiredContendedCustody => unreachable!(),
+        Exercise::SharedReplicaJoin => unreachable!(),
     };
     let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
     let lagger = (leader + 1) % 3;

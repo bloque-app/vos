@@ -5427,6 +5427,150 @@ where
         ))
     }
 
+    /// Admit an existing ordinary Shared generation on a committee member that
+    /// did not originate its Create. The record is untrusted operator-carried
+    /// data: lineage and membership are checked against this owner's pins and
+    /// system journal, then its decision is re-derived through a fresh read of
+    /// this node's own Authority. Only then is a replay proof minted. An exact
+    /// retry of an admitted generation returns its status without any read;
+    /// a different intent for the same Agent is refused.
+    pub fn join_shared_replica(
+        &mut self,
+        record: &super::genesis::AgentGenesisArchiveRecord,
+    ) -> Result<super::shared_host::SharedAgentStatus, SharedAgentHostError> {
+        let authority = self.shared_replica_committee_authority(record.provision())?;
+        if let Some(status) = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .replica_join_status(record.provision(), record.catalog(), authority)?
+        {
+            return Ok(status);
+        }
+        let proof = self.verify_shared_replica_genesis(record.provision())?;
+        self.host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .provision_replay_verified(
+                record.provision().clone(),
+                record.catalog().to_vec(),
+                authority,
+                &proof,
+            )
+    }
+
+    /// Reopen every deferred ordinary generation held only as a replica, from
+    /// the intents its own host retained. Each is re-verified exactly as by
+    /// `join_shared_replica`; the complete set must verify before any serves.
+    /// Startup must have deferred the host and recovered no lifecycle entry.
+    pub fn recover_deferred_shared_replicas(&mut self) -> Result<(), SharedAgentHostError> {
+        let intents = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .deferred_authority_intents()?;
+        if intents.len() > super::shared_host::MAX_SHARED_HOST_AGENTS {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        let mut proofs = Vec::with_capacity(intents.len());
+        for (provision, _, retained) in &intents {
+            if self.shared_replica_committee_authority(provision)? != *retained {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            proofs.push(self.verify_shared_replica_genesis(provision)?);
+        }
+        self.complete_deferred_shared_genesis(proofs)
+    }
+
+    /// Bind an untrusted provision to this owner's lineage and membership and
+    /// return the committee-change binding taken from its signed Create.
+    fn shared_replica_committee_authority(
+        &self,
+        provision: &super::genesis::AgentGenesisProvision,
+    ) -> Result<CommitteeChangeAuthorityBinding, SharedAgentHostError> {
+        let proposal = provision.proposal();
+        let super::journal::ReplayOperation::CleanManage { request, .. } =
+            &proposal.create().operation
+        else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        let ManagementRequest::Create(descriptor) = request else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        let locator = proposal.locator();
+        let target = self.authority_target();
+        let position = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .journal_position(crate::service::AgentId(self.pins.agent.0))?;
+        let claim = provision.evidence().claim();
+        if locator.space.0 != self.pins.space.0
+            || locator.agent.0 == self.pins.agent.0
+            || descriptor.identity.space.0 != locator.space.0
+            || descriptor.identity.agent.0 != locator.agent.0
+            || descriptor.identity.profile != AgentProfile::Shared
+            || claim.space().0 != target.space.0
+            || claim.system_agent().0 != target.system_agent.0
+            || claim.authority_binding().0 != target.binding.commitment().0
+            || claim.system_genesis() != position.genesis
+            || claim.system_admission() != position.admission
+            || provision
+                .replicas()
+                .member_by_node(crate::service::NodeId(self.pins.node.0))
+                .is_none()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        CommitteeChangeAuthorityBinding::new(
+            descriptor.authority.policy,
+            descriptor.authority.issuer,
+            descriptor.identity.runtime_deployment,
+            descriptor.authority.public_key,
+            descriptor.authority.initial_epoch,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)
+    }
+
+    /// Fresh Authority read of the Agent's genesis decision. Like the
+    /// originator's retired-Create check, historical bytes are not finality.
+    fn verify_shared_replica_genesis(
+        &mut self,
+        provision: &super::genesis::AgentGenesisProvision,
+    ) -> Result<ReplayVerifiedAgentGenesisFinality, SharedAgentHostError> {
+        use crate::service::ServiceWire as _;
+        self.recover_pending_authority_projection()?;
+        let position = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .journal_position(crate::service::AgentId(self.pins.agent.0))?;
+        let agent = super::sdk::AgentId(provision.proposal().locator().agent.0);
+        let nonce = Hash::digest(
+            b"vos/shared-genesis/replica-join-read/v1",
+            &[
+                position.genesis.as_bytes(),
+                position.admission.as_bytes(),
+                &position.ordered_index.to_le_bytes(),
+                position
+                    .ordered_head
+                    .map(|head| *head.as_bytes())
+                    .unwrap_or([0; 32])
+                    .as_slice(),
+                agent.as_bytes(),
+            ],
+        );
+        let response = self.invoke_authority_read(AuthorityReadRequest::GenesisDecision {
+            authority: self.authority_target(),
+            agent,
+            nonce,
+        })?;
+        if response != provision.decision().encode() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(ReplayVerifiedAgentGenesisFinality(provision.clone()))
+    }
+
     /// Complete a published live Create without exposing it before retirement.
     /// Cold restart continues through the complete-set deferred recovery path.
     pub(crate) fn complete_live_shared_genesis<B, J, Q, Reply, W, PubReply, S>(
@@ -10145,6 +10289,7 @@ mod tests {
         #[cfg(feature = "experimental-state-blocks")]
         mod external_shared;
         mod recovery_expiry;
+        mod shared_replica;
 
         use alloc::boxed::Box;
         use core::num::NonZeroU64;
@@ -13499,6 +13644,16 @@ mod tests {
             } else {
                 fixed_system_bootstrap_fixtures()
             };
+            if matches!(
+                common_checkpoint,
+                Some(common_checkpoint::Exercise::SharedReplicaJoin)
+            ) {
+                // Only owner-minted replay proofs may admit ordinary Shared
+                // generations; no fixture verifier can hide a missing proof.
+                for fixture in &mut fixtures {
+                    fixture.finality = Arc::new(shared_replica::RefuseArchiveFinality);
+                }
+            }
             // All replicas consume the same transported bundle. Per-node
             // fixtures remain an independent expected-value oracle only.
             let common = PreparedCleanSystemAgentBootstrap {

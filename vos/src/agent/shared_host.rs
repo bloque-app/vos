@@ -2205,6 +2205,65 @@ impl SharedAgentHost {
         Ok(())
     }
 
+    /// Exact-retry check for a replica join. Returns the serving status only
+    /// when the opened generation carries this identical intent; any other
+    /// intent for the same Agent conflicts. Absence grants nothing.
+    #[cfg(all(feature = "network", target_os = "linux"))]
+    pub(crate) fn replica_join_status(
+        &mut self,
+        provision: &AgentGenesisProvision,
+        catalog: &[RuntimeBlob],
+        committee_authority: CommitteeChangeAuthorityBinding,
+    ) -> Result<Option<SharedAgentStatus>, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let intent =
+            SharedGenesisIntent::new(provision.clone(), catalog.to_vec(), committee_authority)?;
+        let agent = intent.agent()?;
+        if self.deferred_generations.contains_key(&agent) {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        match self.agents.get(&agent) {
+            Some(existing) if existing.intent == intent => {
+                status_for(existing, self.transport_is_attached(agent)).map(Some)
+            }
+            Some(_) => Err(SharedAgentHostError::Conflict),
+            None => Ok(None),
+        }
+    }
+
+    /// Authority-finalized inputs retained by every deferred generation. These
+    /// bytes are untrusted: the owner must independently re-verify each one
+    /// against live Authority state before completing the deferred open.
+    #[cfg(all(feature = "network", target_os = "linux"))]
+    pub(crate) fn deferred_authority_intents(
+        &mut self,
+    ) -> Result<
+        Vec<(
+            AgentGenesisProvision,
+            Vec<RuntimeBlob>,
+            CommitteeChangeAuthorityBinding,
+        )>,
+        SharedAgentHostError,
+    > {
+        if !self.deferred_open {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let current = scan_generation_namespaces(&self.lease)?;
+        let mut intents = Vec::with_capacity(self.deferred_generations.len());
+        for agent in self.deferred_generations.keys() {
+            let files = *current
+                .get(agent)
+                .ok_or(SharedAgentHostError::CorruptResidue)?;
+            let (intent, _) = self.read_intent(*agent, files)?;
+            let SharedGenesisAuthority::AuthorityFinalized(provision) = intent.authority else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            intents.push((provision, intent.catalog, intent.committee_authority));
+        }
+        Ok(intents)
+    }
+
     /// Called only after the lifecycle owner verifies signed finalization and
     /// durable retirement. Startup recovery uses the complete-set opener instead.
     #[cfg(all(feature = "network", target_os = "linux"))]
