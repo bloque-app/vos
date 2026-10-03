@@ -985,6 +985,7 @@ fn decode_authority_operation(
         13 => Ok(AuthorityOperationKind::RotatePrivateKeys),
         14 => Ok(AuthorityOperationKind::SetPrivateResourcePolicy),
         15 => Ok(AuthorityOperationKind::PrivateActorLifecycle),
+        16 => Ok(AuthorityOperationKind::SetExecutionLimits),
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -3504,7 +3505,36 @@ pub(crate) fn management_request_valid(value: &ManagementRequest) -> bool {
         ManagementRequest::PrivateControl { control, mutation } => {
             private_control_request_valid(control, mutation)
         }
+        ManagementRequest::SetExecutionLimits(limits) => limits.is_valid(),
     }
+}
+
+fn encode_execution_limits(encoder: &mut Encoder<'_>, value: crate::contract::ExecutionLimits) {
+    encoder.u64(value.max_invocation_gas);
+    encoder.u32(value.max_invocation_reads);
+    encoder.u32(value.max_lane_state_bytes);
+}
+
+/// Canonical execution bounds: valid by [`crate::contract::ExecutionLimits::is_valid`].
+pub fn decode_execution_limits(
+    decoder: &mut Decoder<'_>,
+) -> Result<crate::contract::ExecutionLimits, DecodeError> {
+    let value = crate::contract::ExecutionLimits {
+        max_invocation_gas: decoder.u64()?,
+        max_invocation_reads: decoder.u32()?,
+        max_lane_state_bytes: decoder.u32()?,
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+/// The canonical bytes of execution bounds, as the runtime's state carries them.
+pub fn execution_limits_bytes(value: crate::contract::ExecutionLimits) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    encode_execution_limits(&mut Encoder(&mut bytes), value);
+    bytes
 }
 
 fn encode_management_request(encoder: &mut Encoder<'_>, value: &ManagementRequest) {
@@ -3575,6 +3605,10 @@ fn encode_management_request(encoder: &mut Encoder<'_>, value: &ManagementReques
             encoder.bytes(&control);
             encoder.bytes(&mutation);
         }
+        ManagementRequest::SetExecutionLimits(limits) => {
+            encoder.u8(12);
+            encode_execution_limits(encoder, *limits);
+        }
     }
 }
 
@@ -3634,6 +3668,7 @@ fn decode_management_request(decoder: &mut Decoder<'_>) -> Result<ManagementRequ
                 })?,
             }
         }
+        12 => ManagementRequest::SetExecutionLimits(decode_execution_limits(decoder)?),
         _ => return Err(DecodeError::InvalidTag),
     };
     management_request_valid(&value)
@@ -3676,6 +3711,11 @@ pub(crate) fn management_request_commitment(value: &ManagementRequest) -> Hash {
                 &[&encode_canonical_management_request(value)],
             )
         }
+        // Authorized by a direct receipt over the exact canonical request.
+        ManagementRequest::SetExecutionLimits(_) if value.is_valid() => Hash::digest(
+            b"vos/agent/execution-limits-request/v1",
+            &[&encode_canonical_management_request(value)],
+        ),
         _ => Hash::ZERO,
     }
 }
@@ -3707,6 +3747,9 @@ pub(crate) fn required_management_operation(
         ManagementRequest::Resume { .. } => Some(AuthorityOperationKind::ResumeActor),
         ManagementRequest::RemoveLeaf { .. } => Some(AuthorityOperationKind::RemoveActor),
         ManagementRequest::UpgradeRuntime(_) => Some(AuthorityOperationKind::UpgradeRuntime),
+        ManagementRequest::SetExecutionLimits(_) => {
+            Some(AuthorityOperationKind::SetExecutionLimits)
+        }
         ManagementRequest::ChangeReplicas { .. } => Some(AuthorityOperationKind::ChangeReplicaSet),
         ManagementRequest::PrivateControl { control, .. } => match control.operation {
             PrivateControlOperation::SetResourcePolicy { .. } => {
@@ -3770,7 +3813,10 @@ fn authority_matches_management(
                 .map(|(actor, deployment)| (Some(actor), Some(deployment)))
                 .unwrap_or((None, None)),
         )
-    } else if matches!(request, ManagementRequest::PrivateControl { .. }) {
+    } else if matches!(
+        request,
+        ManagementRequest::PrivateControl { .. } | ManagementRequest::SetExecutionLimits(_)
+    ) {
         (
             required_management_operation(request).unwrap(),
             management_request_commitment(request),
@@ -4634,6 +4680,7 @@ pub(crate) fn management_reply_valid(value: &ManagementReply) -> bool {
         ManagementReply::Removed(actor) => *actor != ActorId::ZERO,
         ManagementReply::ReplicasChanged { generation } => *generation != Hash::ZERO,
         ManagementReply::ResourcePolicySet(policy) => policy.is_valid(),
+        ManagementReply::ExecutionLimitsSet(limits) => limits.is_valid(),
     }
 }
 
@@ -4707,6 +4754,10 @@ fn encode_management_reply(encoder: &mut Encoder<'_>, value: &ManagementReply) {
             encoder.u8(10);
             encode_runtime_resource_policy(encoder, *policy);
         }
+        ManagementReply::ExecutionLimitsSet(limits) => {
+            encoder.u8(12);
+            encode_execution_limits(encoder, *limits);
+        }
     }
 }
 
@@ -4726,6 +4777,7 @@ fn decode_management_reply(decoder: &mut Decoder<'_>) -> Result<ManagementReply,
             generation: Hash(decoder.fixed()?),
         },
         10 => ManagementReply::ResourcePolicySet(decode_runtime_resource_policy(decoder)?),
+        12 => ManagementReply::ExecutionLimitsSet(decode_execution_limits(decoder)?),
         _ => return Err(DecodeError::InvalidTag),
     };
     management_reply_valid(&value)

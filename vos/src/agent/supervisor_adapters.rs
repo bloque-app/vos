@@ -152,7 +152,7 @@ impl AgentInvocationIntent {
             && !self.message.is_empty()
             && self.message.len() <= MAX_INVOCATION_MESSAGE_BYTES
             && self.gas != 0
-            && self.gas <= super::execution::MAX_EXECUTION_GAS
+            && self.gas <= super::execution::MAX_INVOCATION_GAS_CEILING
     }
 }
 
@@ -4509,7 +4509,9 @@ where
         .lock()
         .map_err(|_| AgentRouteAdapterError::Route(AgentRouteError::Unavailable))?
         .install_projection_dispatch(Arc::new(move |query, recovering, sender| {
-            handle.enqueue_peer_projection(query, recovering, sender).is_ok()
+            handle
+                .enqueue_peer_projection(query, recovering, sender)
+                .is_ok()
         }))
         .map_err(|error| AgentRouteAdapterError::Route(map_shared_host_error(error)))?;
     Ok(attachment)

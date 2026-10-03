@@ -1113,7 +1113,9 @@ pub fn run_refine<A: super::Actor>(args_address: u64, args_len: u64) {
         _ => panic!("invalid agent installation-data frame tag"),
     };
 
-    const LANE_ITEM_CAPACITY: usize = crate::agent::execution::MAX_EXECUTION_STATE_BYTES + 1;
+    // The Agent's runtime bounds each lane by the Agent's own limit; an actor accepts
+    // whatever any Agent may allow.
+    const LANE_ITEM_CAPACITY: usize = crate::agent::execution::MAX_AGENT_LANE_STATE_BYTES + 1;
     let linear_item = fetch_owned(LANE_ITEM_CAPACITY).expect("missing linear agent lane");
     let merge_item = fetch_owned(LANE_ITEM_CAPACITY).expect("missing merge agent lane");
     let local_item = fetch_owned(LANE_ITEM_CAPACITY).expect("missing local agent lane");
@@ -1123,7 +1125,7 @@ pub fn run_refine<A: super::Actor>(args_address: u64, args_len: u64) {
             let payload = item.len().checked_sub(1)?;
             total.checked_add(payload)
         })
-        .filter(|len| *len <= crate::agent::execution::MAX_EXECUTION_STATE_TOTAL_BYTES)
+        .filter(|len| *len <= crate::agent::execution::MAX_AGENT_LANE_STATE_BYTES)
         .expect("agent state exceeds the execution aggregate cap");
     let linear = decode_lane(&linear_item).expect("invalid linear agent lane");
     let merge = decode_lane(&merge_item).expect("invalid merge agent lane");
@@ -1289,7 +1291,7 @@ pub fn run_refine<A: super::Actor>(args_address: u64, args_len: u64) {
             .len()
             .checked_add(merge.len())
             .and_then(|len| len.checked_add(local.len()))
-            .filter(|len| *len <= crate::agent::execution::MAX_EXECUTION_STATE_TOTAL_BYTES)
+            .filter(|len| *len <= crate::agent::execution::MAX_AGENT_LANE_STATE_BYTES)
             .expect("agent state exceeds the execution aggregate cap");
         assert!(
             reply_bytes.len() <= crate::agent::execution::MAX_EXECUTION_REPLY_BYTES,

@@ -3342,7 +3342,7 @@ where
         };
         let retirement = crate::agent_sdk::InvocationRetirement::from_work(request.work());
         if !retirement.validate()
-            || retirement.gas > super::execution::MAX_EXECUTION_GAS
+            || retirement.gas > super::execution::MAX_INVOCATION_GAS_CEILING
             || !request.authorization().matches_retirement(&retirement)
         {
             return Err(LocalReplayExecutorError::InvalidRequest.into());
@@ -3393,7 +3393,7 @@ where
         let retirement = crate::agent_sdk::InvocationRetirement::from_work(request.work());
         if retained_external_request_kind(request) != Some(proof.acknowledge)
             || !retirement.validate()
-            || retirement.gas > super::execution::MAX_EXECUTION_GAS
+            || retirement.gas > super::execution::MAX_INVOCATION_GAS_CEILING
             || !request.authorization().matches_retirement(&retirement)
             || proof.retirement != retirement.commitment()
             || proof.authorization != request.authorization().commitment()
@@ -3446,7 +3446,7 @@ where
             .ok_or(SharedJournalDriverError::InvalidProfile)?;
         let invocation_gas = match &work {
             crate::agent_sdk::RuntimeWork::Invoke { invocation, .. } => {
-                if invocation.gas > super::execution::MAX_EXECUTION_GAS {
+                if invocation.gas > super::execution::MAX_INVOCATION_GAS_CEILING {
                     return Err(SharedJournalDriverError::Executor(
                         LocalReplayExecutorError::InvalidRequest,
                     ));
@@ -4610,7 +4610,10 @@ where
             if self
                 .executor
                 .clean_ordered_result_at(
-                    observation.claim().ordered().head
+                    observation
+                        .claim()
+                        .ordered()
+                        .head
                         .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
                     observation.input_id(),
                 )
@@ -6057,17 +6060,22 @@ where
                                 .executor
                                 .clean_ordered_result_at(entry.id(), entry.input.id())
                                 .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
-                            if matches!(outcome, crate::agent_sdk::RuntimeOutcome::Acknowledged(Err(_))) {
+                            if matches!(
+                                outcome,
+                                crate::agent_sdk::RuntimeOutcome::Acknowledged(Err(_))
+                            ) {
                                 // Negative ACKs do not retire custody. Their
                                 // exact absence is rechecked against physical
                                 // replay on reopen; they are ordinary applies.
                                 None
-                            } else { Some(
-                                VerifiedSharedRecoveryObservation::from_published(
-                                    &published, entry, outcome,
+                            } else {
+                                Some(
+                                    VerifiedSharedRecoveryObservation::from_published(
+                                        &published, entry, outcome,
+                                    )
+                                    .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?,
                                 )
-                                .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?,
-                            ) }
+                            }
                         } else {
                             None
                         };

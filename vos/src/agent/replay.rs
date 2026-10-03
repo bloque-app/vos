@@ -12715,6 +12715,7 @@ fn clean_management_artifact_references(
         | crate::agent_sdk::ManagementRequest::Resume { .. }
         | crate::agent_sdk::ManagementRequest::RemoveLeaf { .. }
         | crate::agent_sdk::ManagementRequest::ChangeReplicas { .. }
+        | crate::agent_sdk::ManagementRequest::SetExecutionLimits(_)
         | crate::agent_sdk::ManagementRequest::PrivateControl { .. } => Vec::new(),
     };
     artifacts.sort_unstable_by_key(|artifact| (artifact.hash, artifact.len));
@@ -16165,8 +16166,11 @@ mod aggregate {
         authenticate_artifacts(store, &artifacts)?;
         if !fence_ancestry.validate()
             || fence_ancestry.genesis() != heads.genesis
-            || fence_ancestry.checkpoint_base() != base.common_ancestry_boundary
-                .map(|boundary| boundary.semantic_base).unwrap_or(replay_boundary)
+            || fence_ancestry.checkpoint_base()
+                != base
+                    .common_ancestry_boundary
+                    .map(|boundary| boundary.semantic_base)
+                    .unwrap_or(replay_boundary)
             || fence_ancestry.canonical_head() != canonical_head
             || fence_ancestry.fence() != heads.merge_fence
         {

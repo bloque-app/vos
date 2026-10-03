@@ -1136,7 +1136,7 @@ impl<R: CatalogBlobResolver> ExternalLocalReplayExecutor<R> {
         let actor = match operation {
             ReplayOperation::CleanInvoke { work, .. }
             | ReplayOperation::CleanResume { work, .. } => {
-                if work.gas > MAX_EXECUTION_GAS {
+                if work.gas > super::execution::MAX_INVOCATION_GAS_CEILING {
                     return Err(LocalReplayExecutorError::InvalidRequest);
                 }
                 work.gas

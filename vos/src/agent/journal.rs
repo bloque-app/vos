@@ -950,7 +950,7 @@ impl InvocationOutcomeRequestFacts {
             || self.deployment == DeploymentId::ZERO
             || self.program == ProgramId::ZERO
             || self.gas_limit == 0
-            || self.gas_limit > MAX_EXECUTION_GAS
+            || self.gas_limit > super::execution::MAX_INVOCATION_GAS_CEILING
         {
             return Err(DecodeError::NonCanonical);
         }

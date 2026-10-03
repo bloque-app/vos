@@ -111,6 +111,50 @@ impl RuntimeResourceLimits {
     }
 }
 
+/// Per-Agent bounds of one actor invocation, enforced by the runtime from the
+/// Agent's state. An Agent that never sets them runs under [`Self::STANDARD`],
+/// exactly the bounds a runtime had before they were configurable; its owner
+/// may select others up to [`Self::MAXIMUM`] (`ManagementRequest::
+/// SetExecutionLimits`). Every value is deterministic Agent state, so every
+/// replica and the prover apply the same bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutionLimits {
+    /// Most actor gas one invocation may carry (`InvocationWork::gas`).
+    pub max_invocation_gas: u64,
+    /// Most FETCH reads one invocation may make besides one per caller blob:
+    /// state lanes, control, message and storage rows.
+    pub max_invocation_reads: u32,
+    /// Most bytes of one actor state lane, and of the lanes visible to one
+    /// invocation together.
+    pub max_lane_state_bytes: u32,
+}
+
+impl ExecutionLimits {
+    /// The bounds before they were configurable: 1 G gas, 16 reads, 48 KiB.
+    pub const STANDARD: Self = Self {
+        max_invocation_gas: 1_000_000_000,
+        max_invocation_reads: 16,
+        max_lane_state_bytes: 48 * 1024,
+    };
+    /// The runtime's hard ceilings, covered by its ProgramId. Gas is bounded by
+    /// the host's own outer budget besides; reads by the native work they cause;
+    /// lanes by the state image (`MAX_RUNTIME_STATE_BYTES`).
+    pub const MAXIMUM: Self = Self {
+        max_invocation_gas: 1_000_000_000_000,
+        max_invocation_reads: 64 * 1024,
+        max_lane_state_bytes: 4 * 1024 * 1024,
+    };
+
+    pub const fn is_valid(self) -> bool {
+        self.max_invocation_gas != 0
+            && self.max_invocation_gas <= Self::MAXIMUM.max_invocation_gas
+            && self.max_invocation_reads >= 5
+            && self.max_invocation_reads <= Self::MAXIMUM.max_invocation_reads
+            && self.max_lane_state_bytes >= 1024
+            && self.max_lane_state_bytes <= Self::MAXIMUM.max_lane_state_bytes
+    }
+}
+
 /// Mutable runtime resource policy selected beneath immutable package limits.
 ///
 /// Every mutable ceiling may be narrowed only when the current usage still

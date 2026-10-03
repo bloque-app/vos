@@ -43,6 +43,17 @@ pub const MAX_EXECUTION_PROGRAM_BYTES: usize = crate::agent_sdk::MAX_RUNTIME_PRO
 /// invocation. The host adds its separately configured runtime-management
 /// budget around this value; actor-selected gas itself is never unbounded.
 pub const MAX_EXECUTION_GAS: u64 = 1_000_000_000;
+/// The most actor gas any Agent may allow one invocation
+/// (`ExecutionLimits::MAXIMUM`). Host admission bounds work by this ceiling;
+/// the runtime applies the Agent's own bound ([`ExecutionBounds`]), which is
+/// [`MAX_EXECUTION_GAS`] unless the Agent selected another.
+pub const MAX_INVOCATION_GAS_CEILING: u64 =
+    crate::agent_sdk::contract::ExecutionLimits::MAXIMUM.max_invocation_gas;
+/// The largest actor state lane any Agent may allow (`ExecutionLimits::MAXIMUM`).
+/// The actor-side loader accepts lanes up to this size; the runtime applies the
+/// Agent's own bound.
+pub const MAX_AGENT_LANE_STATE_BYTES: usize =
+    crate::agent_sdk::contract::ExecutionLimits::MAXIMUM.max_lane_state_bytes as usize;
 /// Maximum canonical signed method-policy artifact supplied to one call.
 /// This is separate from actor availability because it is deployment
 /// provenance, not caller-selected input.
@@ -59,6 +70,39 @@ const ACTOR_DISPATCH_CONTROL_CAPACITY: usize = 512;
 pub const ACTOR_FETCH_PROBE_BYTES: usize = 256;
 const MAX_EXECUTION_HOST_CALLS: usize = 4 * 1024;
 const MAX_EXECUTION_FETCH_CALLS: usize = 16 + MAX_EXECUTION_BLOBS;
+
+/// One Agent's bounds of one actor invocation, derived from its
+/// `ExecutionLimits` exactly as the constants above derive from the standard
+/// ones: [`ExecutionBounds::STANDARD`] reproduces them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExecutionBounds {
+    pub(crate) gas: u64,
+    pub(crate) fetch_calls: usize,
+    pub(crate) fetch_bytes: usize,
+    pub(crate) lane: usize,
+}
+
+impl ExecutionBounds {
+    pub(crate) const STANDARD: Self =
+        Self::of(crate::agent_sdk::contract::ExecutionLimits::STANDARD);
+    pub(crate) const MAXIMUM: Self = Self::of(crate::agent_sdk::contract::ExecutionLimits::MAXIMUM);
+
+    pub(crate) const fn of(limits: crate::agent_sdk::contract::ExecutionLimits) -> Self {
+        let lane = limits.max_lane_state_bytes as usize;
+        Self {
+            gas: limits.max_invocation_gas,
+            fetch_calls: limits.max_invocation_reads as usize + MAX_EXECUTION_BLOBS,
+            fetch_bytes: lane
+                + 3
+                + ACTOR_DISPATCH_CONTROL_CAPACITY
+                + MAX_EXECUTION_MESSAGE_BYTES
+                + 5 * ACTOR_FETCH_PROBE_BYTES
+                + MAX_EXECUTION_BLOBS * 32
+                + 2 * MAX_EXECUTION_AVAILABILITY_BYTES,
+            lane,
+        }
+    }
+}
 // Five frames: three lane tags plus aggregate state, control and message.
 // Include one bounded probe per frame so a full valid input is not rejected
 // merely because the guest first discovers its exact frame lengths.
@@ -567,7 +611,7 @@ impl ActorInvocation {
             || self.deployment == DeploymentId::ZERO
             || self.program == ProgramId::ZERO
             || self.gas == 0
-            || self.gas > MAX_EXECUTION_GAS
+            || self.gas > MAX_INVOCATION_GAS_CEILING
             || !self.auth.validate()
             || self.message.is_empty()
             || self.message.len() > MAX_EXECUTION_MESSAGE_BYTES
@@ -625,9 +669,9 @@ impl ActorHostBudget {
     }
 
     #[cfg(feature = "pvm")]
-    fn fetch(&mut self, bytes: usize) -> bool {
-        Self::charge(&mut self.fetch_calls, 1, MAX_EXECUTION_FETCH_CALLS)
-            && Self::charge(&mut self.fetch_bytes, bytes, MAX_EXECUTION_FETCH_BYTES)
+    fn fetch(&mut self, bytes: usize, bounds: &ExecutionBounds) -> bool {
+        Self::charge(&mut self.fetch_calls, 1, bounds.fetch_calls)
+            && Self::charge(&mut self.fetch_bytes, bytes, bounds.fetch_bytes)
     }
 
     #[cfg(feature = "agent-runtime")]
@@ -646,8 +690,8 @@ impl ActorHostBudget {
 
     pub(crate) fn validate(self) -> bool {
         self.calls as usize <= MAX_EXECUTION_HOST_CALLS
-            && self.fetch_calls as usize <= MAX_EXECUTION_FETCH_CALLS
-            && self.fetch_bytes as usize <= MAX_EXECUTION_FETCH_BYTES
+            && self.fetch_calls as usize <= ExecutionBounds::MAXIMUM.fetch_calls
+            && self.fetch_bytes as usize <= ExecutionBounds::MAXIMUM.fetch_bytes
             && self.blake2b_compressions as usize <= MAX_EXECUTION_BLAKE2B_COMPRESS_CALLS
             && self.debug_bytes as usize <= MAX_EXECUTION_DEBUG_BYTES
     }
@@ -784,8 +828,37 @@ pub(crate) fn run_inner_actor_with_storage(
     continuation: Option<ActorMachineContinuation>,
     storage: Option<&dyn super::actor_storage::ActorRowStorage>,
 ) -> Result<ActorRunOutcome, ActorExecutionError> {
+    run_inner_actor_with_bounds(
+        invocation,
+        clean_context,
+        actor_pvm,
+        installation_data,
+        actor_state,
+        continuation,
+        storage,
+        &ExecutionBounds::STANDARD,
+    )
+}
+
+/// [`run_inner_actor_with_storage`] under one Agent's execution bounds.
+#[cfg(feature = "pvm")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_inner_actor_with_bounds(
+    invocation: &ActorInvocation,
+    clean_context: Option<crate::agent_sdk::InvocationContext>,
+    actor_pvm: &[u8],
+    installation_data: Option<&[u8]>,
+    actor_state: &ActorStateLanes,
+    continuation: Option<ActorMachineContinuation>,
+    storage: Option<&dyn super::actor_storage::ActorRowStorage>,
+    bounds: &ExecutionBounds,
+) -> Result<ActorRunOutcome, ActorExecutionError> {
     use super::machine::{ActorMachine, InnerExit};
     use crate::abi::{error, hostcall};
+
+    if invocation.gas > bounds.gas {
+        return Err(ActorExecutionError::InvalidInput);
+    }
 
     if storage.is_some_and(|storage| {
         clean_context
@@ -796,7 +869,7 @@ pub(crate) fn run_inner_actor_with_storage(
     }
     if actor_state
         .encoded_len()
-        .is_none_or(|len| len > MAX_EXECUTION_STATE_TOTAL_BYTES)
+        .is_none_or(|len| len > bounds.lane)
     {
         return Err(ActorExecutionError::InvalidInput);
     }
@@ -877,16 +950,14 @@ pub(crate) fn run_inner_actor_with_storage(
                     .map_err(|_| ActorExecutionError::InvalidActorOutput)?;
                 let len = usize::try_from(registers[8])
                     .ok()
-                    .filter(|len| {
-                        *len <= MAX_EXECUTION_STATE_TOTAL_BYTES + MAX_EXECUTION_REPLY_BYTES + 13
-                    })
+                    .filter(|len| *len <= bounds.lane + MAX_EXECUTION_REPLY_BYTES + 13)
                     .ok_or(ActorExecutionError::InvalidActorOutput)?;
                 let mut output = alloc::vec![0u8; len];
                 machine
                     .read(address, &mut output)
                     .map_err(|_| ActorExecutionError::InvalidActorOutput)?;
                 let (mut reply, state) =
-                    decode_actor_output(invocation, machine.gas_remaining(), output)?;
+                    decode_actor_output(invocation, machine.gas_remaining(), output, bounds)?;
                 return match (reply.status, yielded_continuation.take()) {
                     (ActorExecutionStatus::Yielded, Some(mut continuation)) => {
                         // Memory/PC/registers remain the exact pre-result
@@ -1002,6 +1073,7 @@ pub(crate) fn run_inner_actor_with_storage(
                         if !host_budget.fetch(
                             len.checked_mul(2)
                                 .ok_or(ActorExecutionError::InvalidInput)?,
+                            bounds,
                         ) {
                             return Ok(ActorRunOutcome::Completed {
                                 reply: terminal_reply(
@@ -1042,7 +1114,7 @@ pub(crate) fn run_inner_actor_with_storage(
                             .ok_or(ActorExecutionError::InvalidInput)?;
                         // Charge before allocating or touching guest memory, including
                         // absent-key probes. The full key participates in ownership.
-                        if !host_budget.fetch(key_len) {
+                        if !host_budget.fetch(key_len, bounds) {
                             return Ok(ActorRunOutcome::Completed {
                                 reply: terminal_reply(
                                     invocation,
@@ -1075,7 +1147,7 @@ pub(crate) fn run_inner_actor_with_storage(
                                 if !ActorHostBudget::charge(
                                     &mut host_budget.fetch_bytes,
                                     copied,
-                                    MAX_EXECUTION_FETCH_BYTES,
+                                    bounds.fetch_bytes,
                                 ) {
                                     return Ok(ActorRunOutcome::Completed {
                                         reply: terminal_reply(
@@ -1107,7 +1179,7 @@ pub(crate) fn run_inner_actor_with_storage(
                             .ok_or(ActorExecutionError::InvalidInput)?;
                         // Charge the key read even for an absent blob. The collection
                         // is validated on admission; lookup never consults ambient IO.
-                        if !host_budget.fetch(32) {
+                        if !host_budget.fetch(32, bounds) {
                             return Ok(ActorRunOutcome::Completed {
                                 reply: terminal_reply(
                                     invocation,
@@ -1139,7 +1211,7 @@ pub(crate) fn run_inner_actor_with_storage(
                                 if !ActorHostBudget::charge(
                                     &mut host_budget.fetch_bytes,
                                     work,
-                                    MAX_EXECUTION_FETCH_BYTES,
+                                    bounds.fetch_bytes,
                                 ) {
                                     return Ok(ActorRunOutcome::Completed {
                                         reply: terminal_reply(
@@ -1170,11 +1242,11 @@ pub(crate) fn run_inner_actor_with_storage(
                             .map_err(|_| ActorExecutionError::InvalidInput)?;
                         let capacity = usize::try_from(registers[8])
                             .ok()
-                            .filter(|len| *len <= MAX_EXECUTION_STATE_BYTES + 1)
+                            .filter(|len| *len <= bounds.lane + 1)
                             .ok_or(ActorExecutionError::InvalidInput)?;
                         if let Some(item) = fetch.get(fetch_index) {
                             let copied = item.len().min(capacity);
-                            if !host_budget.fetch(copied) {
+                            if !host_budget.fetch(copied, bounds) {
                                 return Ok(ActorRunOutcome::Completed {
                                     reply: terminal_reply(
                                         invocation,
@@ -1404,6 +1476,7 @@ fn decode_actor_output(
     invocation: &ActorInvocation,
     gas_remaining: u64,
     output: Vec<u8>,
+    bounds: &ExecutionBounds,
 ) -> Result<(ActorExecutionReply, ActorStateLanes), ActorExecutionError> {
     if output.len() < 13 {
         return Err(ActorExecutionError::InvalidActorOutput);
@@ -1415,10 +1488,7 @@ fn decode_actor_output(
     ) as usize;
     let merge_len = u32::from_le_bytes(output[5..9].try_into().unwrap()) as usize;
     let local_len = u32::from_le_bytes(output[9..13].try_into().unwrap()) as usize;
-    if linear_len > MAX_EXECUTION_STATE_BYTES
-        || merge_len > MAX_EXECUTION_STATE_BYTES
-        || local_len > MAX_EXECUTION_STATE_BYTES
-    {
+    if linear_len > bounds.lane || merge_len > bounds.lane || local_len > bounds.lane {
         return Err(ActorExecutionError::InvalidActorOutput);
     }
     let linear_end = 13usize
@@ -1436,7 +1506,7 @@ fn decode_actor_output(
     if linear_len
         .checked_add(merge_len)
         .and_then(|len| len.checked_add(local_len))
-        .is_none_or(|len| len > MAX_EXECUTION_STATE_TOTAL_BYTES)
+        .is_none_or(|len| len > bounds.lane)
     {
         return Err(ActorExecutionError::InvalidActorOutput);
     }
@@ -1526,14 +1596,17 @@ mod tests {
             ACTOR_DISPATCH_CONTROL_CAPACITY,
             MAX_EXECUTION_MESSAGE_BYTES,
         ] {
-            assert!(budget.fetch(ACTOR_FETCH_PROBE_BYTES));
-            assert!(budget.fetch(bytes));
+            assert!(budget.fetch(ACTOR_FETCH_PROBE_BYTES, &ExecutionBounds::STANDARD));
+            assert!(budget.fetch(bytes, &ExecutionBounds::STANDARD));
         }
         for _ in 0..MAX_EXECUTION_BLOBS {
-            assert!(budget.fetch(32 + 2 * MAX_EXECUTION_AVAILABILITY_BYTES / MAX_EXECUTION_BLOBS));
+            assert!(budget.fetch(
+                32 + 2 * MAX_EXECUTION_AVAILABILITY_BYTES / MAX_EXECUTION_BLOBS,
+                &ExecutionBounds::STANDARD
+            ));
         }
         assert_eq!(budget.fetch_bytes as usize, MAX_EXECUTION_FETCH_BYTES);
-        assert!(!budget.fetch(1));
+        assert!(!budget.fetch(1, &ExecutionBounds::STANDARD));
     }
 
     #[test]
@@ -1852,8 +1925,8 @@ mod tests {
         };
         assert!(budget.host_call());
         assert!(!budget.host_call());
-        assert!(budget.fetch(1));
-        assert!(!budget.fetch(0));
+        assert!(budget.fetch(1, &ExecutionBounds::STANDARD));
+        assert!(!budget.fetch(0, &ExecutionBounds::STANDARD));
         #[cfg(feature = "agent-runtime")]
         {
             assert!(budget.blake2b_compression());
@@ -3762,7 +3835,7 @@ mod tests {
         let lane = MAX_EXECUTION_STATE_TOTAL_BYTES / 3;
         let remainder = MAX_EXECUTION_STATE_TOTAL_BYTES - lane * 2;
         let output = actor_output([lane, lane, remainder], MAX_EXECUTION_REPLY_BYTES);
-        assert!(decode_actor_output(&invocation(), 1, output).is_ok());
+        assert!(decode_actor_output(&invocation(), 1, output, &ExecutionBounds::STANDARD).is_ok());
     }
 
     #[cfg(feature = "pvm")]
@@ -3772,7 +3845,7 @@ mod tests {
         let remainder = MAX_EXECUTION_STATE_TOTAL_BYTES - lane * 2 + 1;
         let output = actor_output([lane, lane, remainder], 0);
         assert_eq!(
-            decode_actor_output(&invocation(), 1, output),
+            decode_actor_output(&invocation(), 1, output, &ExecutionBounds::STANDARD),
             Err(ActorExecutionError::InvalidActorOutput)
         );
     }

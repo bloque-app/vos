@@ -290,8 +290,11 @@ impl ManagementAuthorizationPlan {
                 replica_roster_commitment: crate::replica_roster_commitment(replicas),
             },
             // Private controls enter through retained AOC/AOP/PCA evidence,
-            // never through the generic ACC3 management plan.
-            ManagementRequest::PrivateControl { .. } => return None,
+            // never through the generic ACC3 management plan. Execution bounds
+            // are authorized by a direct receipt; they have no ACC3 plan yet.
+            ManagementRequest::PrivateControl { .. } | ManagementRequest::SetExecutionLimits(_) => {
+                return None;
+            }
         })
     }
 
@@ -420,6 +423,8 @@ pub enum AuthorityOperationKind {
     /// lifecycle request is committed by the PCTL and the actor is exposed in
     /// the receipt selector; Private controls do not expose a deployment.
     PrivateActorLifecycle = 15,
+    /// Select the Agent's per-invocation execution bounds.
+    SetExecutionLimits = 16,
 }
 
 impl AuthorityOperationKind {
@@ -464,6 +469,7 @@ impl AuthorityOperationKind {
                 | Self::ResumeActor
                 | Self::RemoveActor
                 | Self::UpgradeRuntime
+                | Self::SetExecutionLimits
                 | Self::ChangeReplicaSet
         )
     }
@@ -2328,6 +2334,7 @@ fn management_application_reply_shape_matches(
         | (_, ManagementReply::RuntimeUpgraded(_))
         | (_, ManagementReply::ReplicasChanged { .. })
         | (_, ManagementReply::ResourcePolicySet(_))
+        | (_, ManagementReply::ExecutionLimitsSet(_))
         | (_, ManagementReply::ManagementHistory(_)) => false,
     }
 }

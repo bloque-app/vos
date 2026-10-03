@@ -255,6 +255,9 @@ pub struct StandardAgentRuntime {
     /// availability reference whose bytes this runtime has hashed to the
     /// actor's current ProgramId. Valid only while that ProgramId is current.
     program_bindings: BTreeMap<ActorId, StandardProgramBinding>,
+    /// The Agent's per-invocation execution bounds; `None` is
+    /// `ExecutionLimits::STANDARD`.
+    execution_limits: Option<crate::agent_sdk::contract::ExecutionLimits>,
     /// Installation identities remain consumed after their actor leaves the
     /// live directory, preventing an install replay from becoming a new
     /// incarnation after `RemoveLeaf`.
@@ -328,6 +331,9 @@ pub struct StandardRuntimeState {
     /// written before an actor's first invocation, which then encodes exactly
     /// as it did before bindings existed.
     pub program_bindings: Vec<StandardProgramBinding>,
+    /// Non-standard execution bounds; absent in every image that never set
+    /// them, which then encodes exactly as it did before they existed.
+    pub execution_limits: Option<crate::agent_sdk::contract::ExecutionLimits>,
 }
 
 /// The availability reference of one actor's program, bound to its ProgramId
@@ -1361,6 +1367,7 @@ impl StandardAgentRuntime {
             system_authority: None,
             actors: BTreeMap::new(),
             program_bindings: BTreeMap::new(),
+            execution_limits: None,
             retired_installation_ids: BTreeSet::new(),
             lane_state: StandardLaneState {
                 linear: Vec::new(),
@@ -1498,7 +1505,14 @@ impl StandardAgentRuntime {
             authority_sequence_high_water: self.authority_sequence_high_water,
             authority_dispositions: self.authority_dispositions.clone(),
             program_bindings: self.program_bindings.values().cloned().collect(),
+            execution_limits: self.execution_limits,
         }
+    }
+
+    /// The bounds of one actor invocation in this Agent.
+    pub(crate) fn execution_limits(&self) -> crate::agent_sdk::contract::ExecutionLimits {
+        self.execution_limits
+            .unwrap_or(crate::agent_sdk::contract::ExecutionLimits::STANDARD)
     }
 
     /// The verified reference bound to `actor`'s current program, if any.
@@ -2023,6 +2037,12 @@ impl StandardAgentRuntime {
             }
             runtime.program_bindings.insert(binding.actor, binding);
         }
+        if state.execution_limits.is_some_and(|limits| {
+            !limits.is_valid() || limits == crate::agent_sdk::contract::ExecutionLimits::STANDARD
+        }) {
+            return Err(LifecycleError::InvalidRequest);
+        }
+        runtime.execution_limits = state.execution_limits;
         for (actor, expected_deployment) in suspended {
             runtime.set_suspended(actor, expected_deployment, true)?;
         }
@@ -3154,8 +3174,10 @@ impl StandardAgentRuntime {
         let bound = self.bound_program_reference(actor_id);
         for (index, blob) in work.availability.iter().enumerate() {
             // The VOS-native profile never receives the program as availability.
-            let is_program = !cfg!(all(feature = "runtime-program-lookup", target_arch = "riscv64"))
-                && match bound {
+            let is_program = !cfg!(all(
+                feature = "runtime-program-lookup",
+                target_arch = "riscv64"
+            )) && match bound {
                 Some(reference) => {
                     blob.reference == *reference && blob.bytes.len() as u64 == reference.len
                 }
@@ -3396,7 +3418,7 @@ impl StandardAgentRuntime {
         };
         if state
             .encoded_len()
-            .is_none_or(|len| len > super::execution::MAX_EXECUTION_STATE_TOTAL_BYTES)
+            .is_none_or(|len| len > self.execution_limits().max_lane_state_bytes as usize)
         {
             return Err(ActorExecutionError::InvalidAvailability);
         }
@@ -3674,7 +3696,7 @@ impl StandardAgentRuntime {
             let state = after
                 .take(lane)
                 .ok_or(ActorExecutionError::InvalidActorOutput)?;
-            if state.len() > super::execution::MAX_EXECUTION_STATE_BYTES {
+            if state.len() > self.execution_limits().max_lane_state_bytes as usize {
                 return Err(ActorExecutionError::InvalidActorOutput);
             }
             let actor = self
@@ -4326,7 +4348,7 @@ impl StandardAgentRuntime {
         mut after: super::execution::ActorStateLanes,
         observed_slot: u64,
     ) -> Result<(), super::execution::ActorExecutionError> {
-        use super::execution::{ActorExecutionError, MAX_EXECUTION_STATE_BYTES};
+        use super::execution::ActorExecutionError;
         self.validate_invocation_target(invocation)?;
         if reply.invocation != invocation.invocation
             || reply.actor != invocation.actor
@@ -4383,7 +4405,7 @@ impl StandardAgentRuntime {
             let state = after
                 .take(lane)
                 .ok_or(ActorExecutionError::InvalidActorOutput)?;
-            if state.len() > MAX_EXECUTION_STATE_BYTES {
+            if state.len() > self.execution_limits().max_lane_state_bytes as usize {
                 return Err(ActorExecutionError::InvalidActorOutput);
             }
             let actor = self
@@ -4506,10 +4528,10 @@ impl StandardAgentRuntime {
         } else {
             self.verify_clean_invocation_authorization(work, authorization, observed_slot)
         }
-            .map_err(|error| match error {
-                crate::agent_sdk::InvocationError::NotCreated => ActorExecutionError::NotCreated,
-                _ => ActorExecutionError::InvalidAuthorization,
-            })?;
+        .map_err(|error| match error {
+            crate::agent_sdk::InvocationError::NotCreated => ActorExecutionError::NotCreated,
+            _ => ActorExecutionError::InvalidAuthorization,
+        })?;
         if !clean_authorization_is_live_at(authorization, observed_slot) {
             return Err(ActorExecutionError::AuthorityExpired);
         }
@@ -5478,7 +5500,7 @@ impl StandardAgentRuntime {
                             .map_or(0, |entry| entry.value.len()),
                     )
                 });
-            if total.is_none_or(|len| len > super::execution::MAX_EXECUTION_STATE_TOTAL_BYTES) {
+            if total.is_none_or(|len| len > self.execution_limits().max_lane_state_bytes as usize) {
                 return Err(LifecycleError::InvalidRequest);
             }
         }
@@ -5860,6 +5882,9 @@ impl StandardAgentRuntime {
             crate::agent_sdk::ManagementRequest::ChangeReplicas { .. } => {
                 AuthorityOperationKind::ChangeReplicaSet
             }
+            crate::agent_sdk::ManagementRequest::SetExecutionLimits(_) => {
+                AuthorityOperationKind::SetExecutionLimits
+            }
             crate::agent_sdk::ManagementRequest::InspectActors { .. }
             | crate::agent_sdk::ManagementRequest::InspectResources
             | crate::agent_sdk::ManagementRequest::InspectManagementHistory
@@ -6169,6 +6194,31 @@ impl StandardAgentRuntime {
                 self.config = Some(projected);
                 self.clean_descriptor = Some(next);
                 Ok(ManagementReply::ReplicasChanged { generation })
+            }
+            ManagementRequest::SetExecutionLimits(limits) => {
+                if self.clean_descriptor.is_none() {
+                    return Err(ManagementError::NotCreated);
+                }
+                if !limits.is_valid() {
+                    return Err(ManagementError::InvalidRequest);
+                }
+                // Narrowing applies only while every actor's current lanes fit.
+                let bound = limits.max_lane_state_bytes as usize;
+                if [
+                    &self.lane_state.linear,
+                    &self.lane_state.merge,
+                    &self.lane_state.local,
+                ]
+                .into_iter()
+                .flatten()
+                .any(|entry| entry.value.len() > bound)
+                {
+                    return Err(ManagementError::ResourceLimit);
+                }
+                self.execution_limits = (*limits
+                    != crate::agent_sdk::contract::ExecutionLimits::STANDARD)
+                    .then_some(*limits);
+                Ok(ManagementReply::ExecutionLimitsSet(*limits))
             }
             ManagementRequest::PrivateControl { .. } => Err(ManagementError::InvalidRequest),
         }

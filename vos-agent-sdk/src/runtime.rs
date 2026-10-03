@@ -579,6 +579,10 @@ pub enum ManagementRequest {
         expected_generation: Hash,
         replicas: Vec<AgentReplica>,
     },
+    /// Select the Agent's per-invocation execution bounds
+    /// ([`crate::contract::ExecutionLimits`]). Refused while any actor's
+    /// current state lanes exceed the requested lane bound.
+    SetExecutionLimits(crate::contract::ExecutionLimits),
     /// Apply one exact owner-signed Private control through the admitted
     /// runtime. The nested mutation is deliberately nonrecursive: a PCTL can
     /// never smuggle another management envelope or authority selector.
@@ -763,6 +767,8 @@ pub enum ManagementReply {
     /// Exact mutable RRP1 policy retained after a Private resource-policy
     /// control succeeds.
     ResourcePolicySet(RuntimeResourcePolicy),
+    /// The Agent's execution bounds after `SetExecutionLimits`.
+    ExecutionLimitsSet(crate::contract::ExecutionLimits),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

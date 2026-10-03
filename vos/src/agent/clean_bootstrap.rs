@@ -968,7 +968,7 @@ impl AuthorizedCleanSystemAgentBootstrap {
     fn validate(&self) -> Result<(), CleanSystemAgentBootstrapRejection> {
         if !self.pins.is_valid()
             || self.invocation_gas == 0
-            || self.invocation_gas > super::execution::MAX_EXECUTION_GAS
+            || self.invocation_gas > super::execution::MAX_INVOCATION_GAS_CEILING
         {
             return Err(CleanSystemAgentBootstrapRejection::InvalidDescriptor);
         }
@@ -1193,7 +1193,7 @@ fn validate_root_bootstrap_materials(
 ) -> Result<(), CleanSystemAgentBootstrapError> {
     if observed_slot == 0
         || invocation_gas == 0
-        || invocation_gas > super::execution::MAX_EXECUTION_GAS
+        || invocation_gas > super::execution::MAX_INVOCATION_GAS_CEILING
         || !fixed_system_roster_matches(descriptor, replicas)
         || runtime.exact_bytes().len() > MAX_PACKAGE_ENCODED_BYTES
         || runtime.package_ref() != &descriptor.runtime_package

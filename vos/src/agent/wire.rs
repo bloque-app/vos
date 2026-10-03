@@ -463,6 +463,41 @@ const STANDARD_CLEAN_ACTOR_INSTALLATIONS_MAGIC: [u8; 4] = *b"SCI2";
 const STANDARD_CLEAN_INVOCATION_ERRORS_MAGIC: [u8; 4] = *b"SCER";
 const STANDARD_SEQUENCED_RETIREMENT_MAGIC: [u8; 4] = *b"SQRT";
 const STANDARD_PROGRAM_BINDINGS_MAGIC: [u8; 4] = *b"SPB1";
+const STANDARD_EXECUTION_LIMITS_MAGIC: [u8; 4] = *b"SXL1";
+
+/// Optional last section of the control component, after the program
+/// bindings: the Agent's non-standard execution bounds.
+fn encode_execution_limits_section(encoder: &mut Encoder<'_>, state: &StandardRuntimeState) {
+    let Some(limits) = state.execution_limits else {
+        return;
+    };
+    encoder
+        .0
+        .extend_from_slice(&STANDARD_EXECUTION_LIMITS_MAGIC);
+    encoder.u16(1);
+    encoder
+        .0
+        .extend_from_slice(&crate::agent_sdk::wire::execution_limits_bytes(limits));
+}
+
+fn decode_execution_limits_section(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<crate::agent_sdk::contract::ExecutionLimits>, DecodeError> {
+    if decoder.exhausted() {
+        return Ok(None);
+    }
+    if decoder.take(4)? != STANDARD_EXECUTION_LIMITS_MAGIC || decoder.u16()? != 1 {
+        return Err(DecodeError::NonCanonical);
+    }
+    let limits = crate::agent_sdk::contract::ExecutionLimits {
+        max_invocation_gas: decoder.u64()?,
+        max_invocation_reads: decoder.u32()?,
+        max_lane_state_bytes: decoder.u32()?,
+    };
+    (limits.is_valid() && limits != crate::agent_sdk::contract::ExecutionLimits::STANDARD)
+        .then_some(Some(limits))
+        .ok_or(DecodeError::NonCanonical)
+}
 
 /// Optional last section of the control component: the guest-verified
 /// program bindings. Absent while empty, so an image without bindings encodes
@@ -471,7 +506,9 @@ fn encode_program_bindings(encoder: &mut Encoder<'_>, state: &StandardRuntimeSta
     if state.program_bindings.is_empty() {
         return;
     }
-    encoder.0.extend_from_slice(&STANDARD_PROGRAM_BINDINGS_MAGIC);
+    encoder
+        .0
+        .extend_from_slice(&STANDARD_PROGRAM_BINDINGS_MAGIC);
     encoder.u16(1);
     encoder.list(&state.program_bindings, |encoder, binding| {
         encoder.fixed(&binding.actor.0);
@@ -484,7 +521,10 @@ fn encode_program_bindings(encoder: &mut Encoder<'_>, state: &StandardRuntimeSta
 fn decode_program_bindings(
     decoder: &mut Decoder<'_>,
 ) -> Result<Vec<super::standard::StandardProgramBinding>, DecodeError> {
-    if decoder.exhausted() {
+    if decoder.exhausted()
+        || decoder.peek(STANDARD_EXECUTION_LIMITS_MAGIC.len())
+            == Some(&STANDARD_EXECUTION_LIMITS_MAGIC[..])
+    {
         return Ok(Vec::new());
     }
     if decoder.take(4)? != STANDARD_PROGRAM_BINDINGS_MAGIC || decoder.u16()? != 1 {
@@ -537,17 +577,20 @@ fn decode_result_component_tail(
     decoder: &mut Decoder<'_>,
     storage: super::InvocationResultStorage,
 ) -> Result<(Vec<super::standard::StandardCleanInvocationError>, u64), DecodeError> {
-    let next_is = |decoder: &Decoder<'_>, magic: &[u8; 4]| {
-        decoder.peek(magic.len()) == Some(&magic[..])
-    };
+    let next_is =
+        |decoder: &Decoder<'_>, magic: &[u8; 4]| decoder.peek(magic.len()) == Some(&magic[..]);
     let errors = if next_is(decoder, &STANDARD_SEQUENCED_RETIREMENT_MAGIC)
         || next_is(decoder, &STANDARD_PROGRAM_BINDINGS_MAGIC)
+        || next_is(decoder, &STANDARD_EXECUTION_LIMITS_MAGIC)
     {
         Vec::new()
     } else {
         decode_clean_invocation_errors(decoder, storage)?
     };
-    if decoder.exhausted() || next_is(decoder, &STANDARD_PROGRAM_BINDINGS_MAGIC) {
+    if decoder.exhausted()
+        || next_is(decoder, &STANDARD_PROGRAM_BINDINGS_MAGIC)
+        || next_is(decoder, &STANDARD_EXECUTION_LIMITS_MAGIC)
+    {
         return Ok((errors, 0));
     }
     if decoder.take(4)? != STANDARD_SEQUENCED_RETIREMENT_MAGIC || decoder.u16()? != 1 {
@@ -875,6 +918,7 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
     encode_clean_invocation_errors(&mut encoder, state, super::InvocationResultStorage::Control);
     encode_sequenced_retirement(&mut encoder, state, super::InvocationResultStorage::Control);
     encode_program_bindings(&mut encoder, state);
+    encode_execution_limits_section(&mut encoder, state);
     RuntimeState {
         control,
         linear: encode_standard_lane(state, StateLane::Linear),
@@ -1346,6 +1390,7 @@ fn decode_standard_runtime_components(
     let (mut clean_invocation_errors, control_retired_through) =
         decode_result_component_tail(&mut decoder, super::InvocationResultStorage::Control)?;
     let program_bindings = decode_program_bindings(&mut decoder)?;
+    let execution_limits = decode_execution_limits_section(&mut decoder)?;
     if !decoder.exhausted() {
         return Err(DecodeError::TrailingBytes);
     }
@@ -1443,6 +1488,7 @@ fn decode_standard_runtime_components(
         authority_sequence_high_water,
         authority_dispositions,
         program_bindings,
+        execution_limits,
     };
     Ok(state)
 }
@@ -3614,69 +3660,71 @@ fn apply_clean_invoke_restored(
         runtime.bind_program(resolved.actor_id(), reference);
     }
     let (invocation, actor_pvm, actor_schema, actor_policies, installation_data) = resolved.parts();
-    let (mut result, commit_candidate) =
-        match runtime.recover_execution(&invocation, observed_slot) {
-            Ok(Some(_)) | Err(ActorExecutionError::DivergentInvocation) => {
-                return Ok(clean_completed(
-                    legacy_state_to_clean(original_state),
-                    Err(InvocationError::DivergentInvocation),
-                ));
-            }
-            unseen => {
-                match runtime.validate_clean_unseen_invocation_slot(&authorization, observed_slot) {
-                    Err(error) => {
-                        return Ok(clean_completed(
-                            legacy_state_to_clean(original_state),
-                            Err(error),
-                        ));
-                    }
-                    Ok(()) => {
-                        let pristine = runtime.clone();
-                        let mut result = match unseen {
-                            Err(error) => Err(error),
-                            Ok(None) if work.recovery_only => {
-                                Err(ActorExecutionError::InvalidAvailability)
-                            }
-                            Ok(None) => match runtime
-                                .validate_clean_execution_installation_data(
+    // The Agent's own execution bounds (`ManagementRequest::SetExecutionLimits`).
+    let execution_limits = runtime.execution_limits();
+    let (mut result, commit_candidate) = match runtime.recover_execution(&invocation, observed_slot)
+    {
+        Ok(Some(_)) | Err(ActorExecutionError::DivergentInvocation) => {
+            return Ok(clean_completed(
+                legacy_state_to_clean(original_state),
+                Err(InvocationError::DivergentInvocation),
+            ));
+        }
+        unseen => {
+            match runtime.validate_clean_unseen_invocation_slot(&authorization, observed_slot) {
+                Err(error) => {
+                    return Ok(clean_completed(
+                        legacy_state_to_clean(original_state),
+                        Err(error),
+                    ));
+                }
+                Ok(()) => {
+                    let pristine = runtime.clone();
+                    let mut result = match unseen {
+                        Err(error) => Err(error),
+                        Ok(None) if work.recovery_only => {
+                            Err(ActorExecutionError::InvalidAvailability)
+                        }
+                        Ok(None) => match runtime
+                            .validate_clean_execution_installation_data(
+                                &work,
+                                installation_data.as_ref(),
+                            )
+                            .and_then(|()| {
+                                runtime.validate_clean_execution_schema(&work, &actor_schema)
+                            })
+                            .and_then(|()| {
+                                authorize_clean_execution_context(
+                                    &runtime,
+                                    &admission,
                                     &work,
-                                    installation_data.as_ref(),
+                                    &authorization,
+                                    &actor_schema,
+                                    &actor_policies,
                                 )
-                                .and_then(|()| {
-                                    runtime.validate_clean_execution_schema(&work, &actor_schema)
-                                })
-                                .and_then(|()| {
-                                    authorize_clean_execution_context(
+                            }) {
+                            Err(error) => Err(error),
+                            Ok(false) => Ok(ActorExecutionReply {
+                                invocation: invocation.invocation,
+                                actor: invocation.actor,
+                                incarnation: invocation.incarnation,
+                                deployment: invocation.deployment,
+                                mode: invocation.mode,
+                                lane: invocation.mode.write_lane(),
+                                status: ActorExecutionStatus::Forbidden,
+                                reply: Vec::new(),
+                                gas_remaining: invocation.gas,
+                                observation: super::execution::ActorObservation::default(),
+                            }),
+                            Ok(true) => runtime.prepare_execution_state(&invocation).and_then(
+                                |before| {
+                                    let visible = before.visible_for(invocation.mode);
+                                    let outcome = storage_backend.execute(
                                         &runtime,
-                                        &admission,
                                         &work,
-                                        &authorization,
                                         &actor_schema,
-                                        &actor_policies,
-                                    )
-                                }) {
-                                Err(error) => Err(error),
-                                Ok(false) => Ok(ActorExecutionReply {
-                                    invocation: invocation.invocation,
-                                    actor: invocation.actor,
-                                    incarnation: invocation.incarnation,
-                                    deployment: invocation.deployment,
-                                    mode: invocation.mode,
-                                    lane: invocation.mode.write_lane(),
-                                    status: ActorExecutionStatus::Forbidden,
-                                    reply: Vec::new(),
-                                    gas_remaining: invocation.gas,
-                                    observation: super::execution::ActorObservation::default(),
-                                }),
-                                Ok(true) => runtime.prepare_execution_state(&invocation).and_then(
-                                    |before| {
-                                        let visible = before.visible_for(invocation.mode);
-                                        let outcome = storage_backend.execute(
-                                            &runtime,
-                                            &work,
-                                            &actor_schema,
-                                            |storage| {
-                                                super::execution::run_inner_actor_with_storage(
+                                        |storage| {
+                                            super::execution::run_inner_actor_with_bounds(
                                                 &invocation,
                                                 Some(
                                                     crate::agent_sdk::InvocationContext::from_work(
@@ -3691,55 +3739,19 @@ fn apply_clean_invoke_restored(
                                                 &visible,
                                                 None,
                                                 Some(storage),
+                                                &super::execution::ExecutionBounds::of(
+                                                    execution_limits,
+                                                ),
                                             )
-                                            },
-                                        );
-                                        outcome.and_then(|outcome| match outcome {
-                                            super::execution::ActorRunOutcome::Completed {
-                                                mut reply,
-                                                state: next_state,
-                                                rows,
-                                            } => {
-                                                if reply.status == ActorExecutionStatus::Done {
-                                                    let inline = if rows.is_empty() {
-                                                        Vec::new()
-                                                    } else {
-                                                        invocation
-                                                            .mode
-                                                            .write_lane()
-                                                            .and_then(|lane| next_state.get(lane))
-                                                            .unwrap_or_default()
-                                                            .to_vec()
-                                                    };
-                                                    let commit =
-                                                        |runtime: &mut StandardAgentRuntime| {
-                                                            runtime.commit_resolved_clean_execution(
-                                                                &resolved,
-                                                                &authorization,
-                                                                &mut reply,
-                                                                &before,
-                                                                next_state,
-                                                                observed_slot,
-                                                                None,
-                                                            )
-                                                        };
-                                                    storage_backend.commit(
-                                                        &mut runtime,
-                                                        &work,
-                                                        &actor_schema,
-                                                        inline,
-                                                        rows,
-                                                        commit,
-                                                    )?;
-                                                }
-                                                Ok(reply)
-                                            }
-                                            super::execution::ActorRunOutcome::Yielded {
-                                                reply,
-                                                state: next_state,
-                                                continuation,
-                                                rows,
-                                            } => {
+                                        },
+                                    );
+                                    outcome.and_then(|outcome| match outcome {
+                                        super::execution::ActorRunOutcome::Completed {
+                                            mut reply,
+                                            state: next_state,
+                                            rows,
+                                        } => {
+                                            if reply.status == ActorExecutionStatus::Done {
                                                 let inline = if rows.is_empty() {
                                                     Vec::new()
                                                 } else {
@@ -3752,7 +3764,45 @@ fn apply_clean_invoke_restored(
                                                 };
                                                 let commit =
                                                     |runtime: &mut StandardAgentRuntime| {
-                                                        runtime.commit_yielded_execution(
+                                                        runtime.commit_resolved_clean_execution(
+                                                            &resolved,
+                                                            &authorization,
+                                                            &mut reply,
+                                                            &before,
+                                                            next_state,
+                                                            observed_slot,
+                                                            None,
+                                                        )
+                                                    };
+                                                storage_backend.commit(
+                                                    &mut runtime,
+                                                    &work,
+                                                    &actor_schema,
+                                                    inline,
+                                                    rows,
+                                                    commit,
+                                                )?;
+                                            }
+                                            Ok(reply)
+                                        }
+                                        super::execution::ActorRunOutcome::Yielded {
+                                            reply,
+                                            state: next_state,
+                                            continuation,
+                                            rows,
+                                        } => {
+                                            let inline = if rows.is_empty() {
+                                                Vec::new()
+                                            } else {
+                                                invocation
+                                                    .mode
+                                                    .write_lane()
+                                                    .and_then(|lane| next_state.get(lane))
+                                                    .unwrap_or_default()
+                                                    .to_vec()
+                                            };
+                                            let commit = |runtime: &mut StandardAgentRuntime| {
+                                                runtime.commit_yielded_execution(
                                         &invocation,
                                         &reply,
                                         &before,
@@ -3767,38 +3817,38 @@ fn apply_clean_invoke_restored(
                                             authorization.clone(),
                                         )),
                                     )
-                                                    };
-                                                storage_backend.commit(
-                                                    &mut runtime,
-                                                    &work,
-                                                    &actor_schema,
-                                                    inline,
-                                                    rows,
-                                                    commit,
-                                                )?;
-                                                Ok(reply)
-                                            }
-                                        })
-                                    },
-                                ),
-                            },
-                            Ok(Some(_)) => unreachable!("exact recovery returned above"),
-                        };
-                        let committed = finalize_unseen_clean_outcome(
-                            &mut runtime,
-                            pristine,
-                            &work,
-                            &authorization,
-                            &invocation,
-                            observed_slot,
-                            None,
-                            &mut result,
-                        );
-                        (result, committed)
-                    }
+                                            };
+                                            storage_backend.commit(
+                                                &mut runtime,
+                                                &work,
+                                                &actor_schema,
+                                                inline,
+                                                rows,
+                                                commit,
+                                            )?;
+                                            Ok(reply)
+                                        }
+                                    })
+                                },
+                            ),
+                        },
+                        Ok(Some(_)) => unreachable!("exact recovery returned above"),
+                    };
+                    let committed = finalize_unseen_clean_outcome(
+                        &mut runtime,
+                        pristine,
+                        &work,
+                        &authorization,
+                        &invocation,
+                        observed_slot,
+                        None,
+                        &mut result,
+                    );
+                    (result, committed)
                 }
             }
-        };
+        }
+    };
     let successor = finish_standard_execution_candidate(
         original_state,
         &runtime,
@@ -3915,6 +3965,8 @@ fn apply_clean_resume_restored(
         }
     };
     let (invocation, actor_pvm, actor_schema, actor_policies, installation_data) = resolved.parts();
+    // The Agent's own execution bounds (`ManagementRequest::SetExecutionLimits`).
+    let execution_limits = runtime.execution_limits();
     if invocation.commitment() != record.request {
         return Ok(clean_completed(
             legacy_state_to_clean(original_state),
@@ -3951,7 +4003,7 @@ fn apply_clean_resume_restored(
         .and_then(|before| {
             let visible = before.visible_for(invocation.mode);
             let outcome = storage_backend.execute(&runtime, &work, &actor_schema, |storage| {
-                super::execution::run_inner_actor_with_storage(
+                super::execution::run_inner_actor_with_bounds(
                     &invocation,
                     Some(crate::agent_sdk::InvocationContext::from_work(
                         &work,
@@ -3962,6 +4014,7 @@ fn apply_clean_resume_restored(
                     &visible,
                     Some(record.continuation.clone()),
                     Some(storage),
+                    &super::execution::ExecutionBounds::of(execution_limits),
                 )
             });
             outcome.and_then(|outcome| match outcome {

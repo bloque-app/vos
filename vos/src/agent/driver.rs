@@ -187,6 +187,9 @@ fn clean_management_operation(
         ManagementRequest::RemoveLeaf { .. } => Some(AuthorityOperationKind::RemoveActor),
         ManagementRequest::UpgradeRuntime(_) => Some(AuthorityOperationKind::UpgradeRuntime),
         ManagementRequest::ChangeReplicas { .. } => Some(AuthorityOperationKind::ChangeReplicaSet),
+        ManagementRequest::SetExecutionLimits(_) => {
+            Some(AuthorityOperationKind::SetExecutionLimits)
+        }
         // Private controls have their own retained authority/application
         // path and are never admitted by a generic Local/Shared driver.
         ManagementRequest::PrivateControl { .. } => None,
@@ -671,7 +674,8 @@ fn sdk_descriptor_after_management(
         | ManagementRequest::UpgradeActor(_)
         | ManagementRequest::Suspend { .. }
         | ManagementRequest::Resume { .. }
-        | ManagementRequest::RemoveLeaf { .. } => {}
+        | ManagementRequest::RemoveLeaf { .. }
+        | ManagementRequest::SetExecutionLimits(_) => {}
     }
     next.validate()
         .map_err(|_| AgentDriverError::InvalidRuntime)?;
@@ -4089,7 +4093,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 resume: Box::new(resume),
             },
             self.management_gas
-                .saturating_add(super::execution::MAX_EXECUTION_GAS),
+                .saturating_add(super::execution::MAX_INVOCATION_GAS_CEILING),
         )
     }
 
@@ -4150,7 +4154,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             return self.apply_sdk_work_with_exact(
                 runtime_work,
                 self.management_gas
-                    .saturating_add(super::execution::MAX_EXECUTION_GAS),
+                    .saturating_add(super::execution::MAX_INVOCATION_GAS_CEILING),
                 Some(&work),
             );
         }
@@ -4172,7 +4176,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 self.apply_sdk_work_with_exact(
                     runtime_work,
                     self.management_gas
-                        .saturating_add(super::execution::MAX_EXECUTION_GAS),
+                        .saturating_add(super::execution::MAX_INVOCATION_GAS_CEILING),
                     Some(&work),
                 )
             }

@@ -1535,7 +1535,7 @@ fn validate_invocation_shape_before_reservation(
         || invocation.deployment == DeploymentId::ZERO
         || invocation.program == ProgramId::ZERO
         || invocation.gas == 0
-        || invocation.gas > MAX_EXECUTION_GAS
+        || invocation.gas > super::execution::MAX_INVOCATION_GAS_CEILING
         || !invocation.auth.validate()
         || invocation.message.is_empty()
         || invocation.message.len() > MAX_EXECUTION_MESSAGE_BYTES

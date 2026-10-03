@@ -25,6 +25,7 @@ pub(crate) trait ActorRowStorage {
 const MAGIC: &[u8; 4] = b"ALI1";
 const HEADER_BYTES: usize = 4 + 32 + 4 + 4;
 const MAX_IMAGE_BYTES: usize = super::execution::MAX_RUNTIME_STATE_BYTES;
+// The standard lane bound: inline row storage keeps its size whatever an Agent's lanes allow.
 const MAX_INLINE_BYTES: usize = super::execution::MAX_EXECUTION_STATE_BYTES;
 const MAX_ROW_BYTES: usize = crate::actors::storage::MAX_VALUE_BYTES;
 // A key is a bounded byte string, not a truncated/prefix-matched identity.

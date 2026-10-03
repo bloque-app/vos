@@ -2227,7 +2227,8 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             | ManagementRequest::Suspend { .. }
             | ManagementRequest::Resume { .. }
             | ManagementRequest::RemoveLeaf { .. }
-            | ManagementRequest::ChangeReplicas { .. } => {
+            | ManagementRequest::ChangeReplicas { .. }
+            | ManagementRequest::SetExecutionLimits(_) => {
                 super::driver::validate_sdk_management_artifacts(
                     descriptor,
                     request,
@@ -2829,8 +2830,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 self.pending_clean_invocation_results.remove(&evicted);
             }
         }
-        self.pending_clean_invocation_results
-            .insert(input, result);
+        self.pending_clean_invocation_results.insert(input, result);
         if let Some(cached) = self.recent_clean_ordered_results.get_mut(&input) {
             *cached = recent;
             return;
