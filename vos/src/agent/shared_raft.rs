@@ -4694,11 +4694,10 @@ mod application_ledger_v2 {
                 || self.initial_committee.profile() != AgentProfile::Shared
                 || self.initial_committee.space() != self.generation.space
                 || self.initial_committee.agent() != self.generation.agent
-                || self
-                    .initial_committee
-                    .member_by_node(self.local_node)
-                    .is_none()
             {
+                // A joiner's local node is outside the initial committee.
+                // Membership is enforced where a configuration row is first
+                // written: only an initial member or an explicit joiner open.
                 return Err(AgentRaftWireError::InvalidApplyMeta);
             }
             enforce_wire_bound(self, CONFIG_RECORD_MAX_BYTES)
@@ -5632,6 +5631,50 @@ mod application_ledger_v2 {
             initial_committee: AgentReplicaCommittee,
             authority: CommitteeChangeAuthorityBinding,
         ) -> Result<Self, AgentRaftApplicationErrorV2> {
+            Self::open_with_role(
+                database,
+                generation,
+                journal_store,
+                local_node,
+                initial_committee,
+                authority,
+                false,
+            )
+        }
+
+        /// Explicitly create the ledger of a replica outside the initial
+        /// committee. It applies the authenticated log as a passive replica
+        /// until an authority-signed committee change admits it. Reopening an
+        /// existing joiner ledger uses ordinary `open`: its exact durable
+        /// configuration row is the only evidence a fresh open accepts.
+        pub(crate) fn open_joiner(
+            database: Arc<Database>,
+            generation: AgentGenerationRouteKey,
+            journal_store: JournalStoreInstanceId,
+            local_node: NodeId,
+            initial_committee: AgentReplicaCommittee,
+            authority: CommitteeChangeAuthorityBinding,
+        ) -> Result<Self, AgentRaftApplicationErrorV2> {
+            Self::open_with_role(
+                database,
+                generation,
+                journal_store,
+                local_node,
+                initial_committee,
+                authority,
+                true,
+            )
+        }
+
+        fn open_with_role(
+            database: Arc<Database>,
+            generation: AgentGenerationRouteKey,
+            journal_store: JournalStoreInstanceId,
+            local_node: NodeId,
+            initial_committee: AgentReplicaCommittee,
+            authority: CommitteeChangeAuthorityBinding,
+            joiner: bool,
+        ) -> Result<Self, AgentRaftApplicationErrorV2> {
             generation
                 .validate()
                 .map_err(|_| AgentRaftApplicationErrorV2::ConfigurationMismatch)?;
@@ -5647,10 +5690,11 @@ mod application_ledger_v2 {
             if initial_committee.profile() != AgentProfile::Shared
                 || initial_committee.space() != generation.space
                 || initial_committee.agent() != generation.agent
-                || initial_committee.member_by_node(local_node).is_none()
+                || (joiner && initial_committee.member_by_node(local_node).is_some())
             {
                 return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
             }
+            let initial_member = initial_committee.member_by_node(local_node).is_some();
             let expected = ApplicationConfigV2 {
                 version: APPLICATION_SCHEMA_VERSION,
                 generation,
@@ -5701,6 +5745,11 @@ mod application_ledger_v2 {
                     validate_bound_committee_state(&state, generation, authority)?;
                 }
                 None => {
+                    // Only an initial member, or an explicit joiner, may bind
+                    // a fresh generation to this local node.
+                    if !initial_member && !joiner {
+                        return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
+                    }
                     if read_meta_in_write(&transaction, key.as_slice())?.is_some()
                         || read_committee_state_in_write(&transaction, key.as_slice())?.is_some()
                         || read_command_reservation_in_write(&transaction, key.as_slice())?
@@ -5762,6 +5811,22 @@ mod application_ledger_v2 {
 
         pub(crate) const fn generation(&self) -> AgentGenerationRouteKey {
             self.generation
+        }
+
+        /// An active member applies ordinary commands. So does a joiner (a
+        /// node outside the initial committee) while it replays the
+        /// authenticated log before the change that admits it; an initial
+        /// member that was removed does not.
+        fn applies_as_local_replica(&self, active: &AgentReplicaCommittee, local: NodeId) -> bool {
+            active.member_by_node(local).is_some()
+                || self.initial_committee.member_by_node(local).is_none()
+        }
+
+        /// Whether this local replica is outside the initial committee.
+        pub(crate) fn is_joiner(&self) -> bool {
+            self.initial_committee
+                .member_by_node(self.local_node)
+                .is_none()
         }
 
         pub(crate) const fn journal_store(&self) -> JournalStoreInstanceId {
@@ -7463,7 +7528,7 @@ mod application_ledger_v2 {
             if route.committee() != state.active.id() {
                 return Err(AgentRaftApplicationErrorV2::StaleCommittee);
             }
-            if state.active.member_by_node(self.local_node).is_none() {
+            if !self.applies_as_local_replica(&state.active, self.local_node) {
                 return Err(AgentRaftApplicationErrorV2::WrongLocalReplica);
             }
 
@@ -7982,7 +8047,7 @@ mod application_ledger_v2 {
             if reserved.route().committee() != state.active.id() {
                 return Err(AgentRaftApplicationErrorV2::StaleCommittee);
             }
-            if state.active.member_by_node(reserved.local_node()).is_none() {
+            if !self.applies_as_local_replica(&state.active, reserved.local_node()) {
                 return Err(AgentRaftApplicationErrorV2::WrongLocalReplica);
             }
             let stored = read_command_reservation_in_write(&transaction, key.as_slice())?
@@ -12712,6 +12777,108 @@ mod tests {
             ledger.apply_foundation_slot(&stable).unwrap(),
             AgentRaftFoundationApplyOutcomeV2::Duplicate(_)
         ));
+    }
+
+    /// A node outside the initial committee binds a fresh ledger only through
+    /// the explicit joiner open, applies the authenticated transition that
+    /// admits it, and is then reopened by the ordinary open from its exact
+    /// durable configuration row.
+    #[cfg(feature = "storage")]
+    #[test]
+    fn v2_joiner_ledger_opens_only_explicitly_and_applies_its_admission() {
+        let directory = TempDirectory::new("v2_joiner_ledger");
+        let path = directory.database();
+        let initial = committee(&[key(1)], &[]);
+        let next = committee(&[key(1), key(2), key(3)], &[]);
+        let generation = route(&initial).generation();
+        let store = journal_store(0xc9);
+        let joiner = member(&key(2), ReplicaRole::Voter).replica().node;
+        assert!(initial.member_by_node(joiner).is_none());
+
+        {
+            let database = Arc::new(Database::create(&path).unwrap());
+            assert!(matches!(
+                AgentRaftApplicationLedgerV2::open(
+                    Arc::clone(&database),
+                    generation,
+                    store,
+                    joiner,
+                    initial.clone(),
+                    committee_authority_binding(),
+                ),
+                Err(AgentRaftApplicationErrorV2::ConfigurationMismatch)
+            ));
+            assert!(matches!(
+                AgentRaftApplicationLedgerV2::open_joiner(
+                    Arc::clone(&database),
+                    generation,
+                    store,
+                    initial.members()[0].replica().node,
+                    initial.clone(),
+                    committee_authority_binding(),
+                ),
+                Err(AgentRaftApplicationErrorV2::ConfigurationMismatch)
+            ));
+            let ledger = AgentRaftApplicationLedgerV2::open_joiner(
+                Arc::clone(&database),
+                generation,
+                store,
+                joiner,
+                initial.clone(),
+                committee_authority_binding(),
+            )
+            .unwrap();
+            assert!(ledger.is_joiner());
+            let change = committee_change(
+                generation,
+                &initial,
+                &next,
+                COMMITTEE_AUTHORITY_EPOCH,
+                1,
+                10,
+            );
+            let previous_voters = change.previous_voters().to_vec();
+            let next_voters = change.next_voters().to_vec();
+            for kind in [
+                EntryKind::Data {
+                    payload: AgentRaftCommand::PrepareCommitteeChange(change).encode(),
+                },
+                EntryKind::ConfigChange {
+                    joint_old: Some(previous_voters),
+                    members: next_voters.clone(),
+                },
+                EntryKind::ConfigChange {
+                    joint_old: None,
+                    members: next_voters,
+                },
+            ] {
+                ledger.append_committed_for_test(7, &kind).unwrap();
+                let slot = ledger.next_committed_slot().unwrap().unwrap();
+                assert!(matches!(
+                    ledger.apply_foundation_slot(&slot).unwrap(),
+                    AgentRaftFoundationApplyOutcomeV2::Applied(_)
+                ));
+            }
+            assert_eq!(ledger.active_committee().unwrap(), next);
+        }
+
+        let database = Arc::new(Database::create(&path).unwrap());
+        let ledger = AgentRaftApplicationLedgerV2::open(
+            database,
+            generation,
+            store,
+            joiner,
+            initial,
+            committee_authority_binding(),
+        )
+        .unwrap();
+        ledger.audit_recovery().unwrap();
+        assert!(ledger.is_joiner());
+        assert_eq!(ledger.active_committee().unwrap(), next);
+        assert_eq!(
+            ledger.authority_epoch().unwrap(),
+            COMMITTEE_AUTHORITY_EPOCH + 1
+        );
     }
 
     #[cfg(feature = "storage")]

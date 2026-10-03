@@ -744,6 +744,10 @@ struct AttachmentFingerprint {
     voters: Vec<NodeId>,
     joint_old: Option<Vec<NodeId>>,
     local_role: ReplicaRole,
+    /// The local node is an explicit joiner replaying the log before the
+    /// committee change that names it. It is a route member of its own
+    /// attachment only, as a passive worker.
+    joining: bool,
 }
 
 impl AttachmentFingerprint {
@@ -779,12 +783,29 @@ impl AttachmentFingerprint {
             local_role: status
                 .local_role
                 .ok_or(SharedAgentHostError::ScopeMismatch)?,
+            joining: status.joining,
         })
+    }
+
+    /// Route destinations for this attachment. A joiner adds only itself,
+    /// under its own authenticated transport identity.
+    fn route_members(&self, local: NodeId, local_peer: PeerId) -> Vec<(NodeId, PeerId)> {
+        let mut members = self.members.clone();
+        if self.joining && !members.iter().any(|(node, _)| *node == local) {
+            members.push((local, local_peer));
+            members.sort_unstable_by_key(|(node, _)| *node);
+        }
+        members
     }
 
     fn validates_local(&self, local: NodeId) -> bool {
         if self.next_committee.is_some() != self.next_voters.is_some() {
             return false;
+        }
+        if self.joining {
+            return self.local_role == ReplicaRole::Observer
+                && self.next_committee.is_none()
+                && !self.members.iter().any(|(node, _)| *node == local);
         }
         let member = self
             .members
@@ -3454,6 +3475,20 @@ impl SharedRouteHandler {
             next_voters,
             next_committee,
         } = change;
+        // A Prepare must be followed by its joint leg in the same term. Refuse
+        // before appending when the worker could not start a membership
+        // change: not leading, a change in flight, or an unconfirmed removal
+        // of a voter (vos-raft refuses the next change until every removed
+        // voter acknowledges its final configuration).
+        let ready = futures_executor::block_on(worker.snapshot()).is_some_and(|state| {
+            state.role == vos_raft::Role::Leader
+                && state.joint_old.is_none()
+                && state.retirement_final_index.is_none()
+                && state.commit_index == state.last_log_index
+        });
+        if !ready {
+            return Err(SharedAgentHostError::Unavailable);
+        }
         self.committee_fence.store(true, Ordering::Release);
         let Ok(prepare) = futures_executor::block_on(worker.propose(command)) else {
             // Nothing was appended.
@@ -7052,7 +7087,11 @@ impl SharedAgentNetworkHost {
             network: Arc::clone(&self.network),
             route,
             agent,
-            route_nodes: fingerprint.members.iter().map(|(node, _)| *node).collect(),
+            route_nodes: fingerprint
+                .route_members(local, self.network.peer_id())
+                .iter()
+                .map(|(node, _)| *node)
+                .collect(),
             worker: handle,
             proposal: Mutex::new(initial_admission),
             committee_fence: AtomicBool::new(false),
@@ -7133,7 +7172,7 @@ impl SharedAgentNetworkHost {
                             if network
                                 .install_agent_route(
                                     route,
-                                    next.members.clone(),
+                                    next.route_members(local, network.peer_id()),
                                     Arc::clone(&route_handler),
                                 )
                                 .is_ok()
@@ -7244,7 +7283,11 @@ impl SharedAgentNetworkHost {
         };
         if self
             .network
-            .install_agent_route(route, fingerprint.members.clone(), Arc::clone(&handler))
+            .install_agent_route(
+                route,
+                fingerprint.route_members(local, self.network.peer_id()),
+                Arc::clone(&handler),
+            )
             .is_err()
         {
             drop(activation);
@@ -7337,7 +7380,7 @@ impl SharedAgentNetworkHost {
                     .network
                     .install_agent_route(
                         route,
-                        fingerprint.members.clone(),
+                        fingerprint.route_members(local, self.network.peer_id()),
                         Arc::clone(&attached.handler),
                     )
                     .is_ok()
@@ -9071,6 +9114,7 @@ mod tests {
             next_voters: None,
             joint_old: None,
             local_role: ReplicaRole::Voter,
+            joining: false,
         };
         assert!(!base.requires_promotion_barrier(false, true, false, false, false));
         for required in 0..4 {
@@ -9142,6 +9186,7 @@ mod tests {
             voters,
             joint_old: None,
             local_role: ReplicaRole::Voter,
+            joining: false,
         };
         assert!(fingerprint.validates_local(local));
         assert!(fingerprint.owns_raft_worker(local));

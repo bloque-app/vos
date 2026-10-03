@@ -460,6 +460,8 @@ pub(crate) struct SharedAgentAttachmentStatus {
     pub(crate) replicas: Vec<SharedReplicaRoute>,
     pub(crate) committee_transition: Option<SharedCommitteeTransitionRoute>,
     pub(crate) transport: SharedAgentTransportState,
+    /// The local node is an explicit joiner not yet named by any committee.
+    pub(crate) joining: bool,
 }
 
 /// Exact SDK identity projection reconstructed from one authenticated Shared
@@ -1691,7 +1693,10 @@ impl SharedAgentHost {
             {
                 return Err(SharedAgentHostError::InvalidProvision);
             }
-            let sealed = host.verify_and_prepare(&intent)?;
+            // A retained non-member intent was written only by explicit
+            // joiner provisioning; reopen it as that joiner.
+            let sealed =
+                host.verify_and_prepare_with_role(&intent, host.finality.as_ref(), true)?;
             install_host_record(&host.intent_path(agent), &encoded)?;
             files.intent = true;
             let exposed = host.read_exposure(agent, intent.id(), files)?;
@@ -1784,7 +1789,7 @@ impl SharedAgentHost {
         ) {
             return Err(SharedAgentHostError::InvalidProvision);
         }
-        let sealed = self.verify_and_prepare_with_finality(&intent, finality)?;
+        let sealed = self.verify_and_prepare_with_role(&intent, finality, true)?;
         install_host_record(&self.intent_path(agent), &encoded)?;
         files.intent = true;
         let exposed = self.read_exposure(agent, intent.id(), files)?;
@@ -1972,6 +1977,28 @@ impl SharedAgentHost {
         self.provision_intent(intent)
     }
 
+    /// Explicitly provision a generation on a fresh node outside its genesis
+    /// committee. The finalized provision is verified exactly as for a member
+    /// and its journal is opened at genesis; the node then replays the
+    /// authenticated log as a passive replica and gains authority only through
+    /// an authority-signed committee change that names it. The retained
+    /// intent of a non-member generation is written only here, so reopening
+    /// it later is evidence of this explicit admission.
+    ///
+    /// The node must receive the log from index 1: a compacted generation
+    /// needs an authenticated checkpoint transfer, which this does not do.
+    pub fn provision_joiner(
+        &mut self,
+        provision: AgentGenesisProvision,
+        catalog: Vec<RuntimeBlob>,
+        committee_authority: CommitteeChangeAuthorityBinding,
+    ) -> Result<SharedAgentStatus, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let intent = SharedGenesisIntent::new(provision, catalog, committee_authority)?;
+        let finality = Arc::clone(&self.finality);
+        self.provision_intent_with_role(intent, finality.as_ref(), true)
+    }
+
     /// Provision the first system Agent from direct root/QC finality. Unlike
     /// ordinary Shared admission this path never consults the system-Agent
     /// finality verifier, which would be circular before the authority actor
@@ -2021,6 +2048,15 @@ impl SharedAgentHost {
         intent: SharedGenesisIntent,
         finality: &dyn AgentGenesisFinalityVerifier,
     ) -> Result<SharedAgentStatus, SharedAgentHostError> {
+        self.provision_intent_with_role(intent, finality, false)
+    }
+
+    fn provision_intent_with_role(
+        &mut self,
+        intent: SharedGenesisIntent,
+        finality: &dyn AgentGenesisFinalityVerifier,
+        joiner: bool,
+    ) -> Result<SharedAgentStatus, SharedAgentHostError> {
         let agent = intent.agent()?;
         if self.deferred_generations.contains_key(&agent) {
             return Err(SharedAgentHostError::Conflict);
@@ -2030,10 +2066,16 @@ impl SharedAgentHost {
                 .committee()
                 .member_by_node(self.scope().node)
                 .is_none()
+                != joiner
+            || (joiner
+                && !matches!(
+                    intent.authority,
+                    SharedGenesisAuthority::AuthorityFinalized(_)
+                ))
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        let sealed = self.verify_and_prepare_with_finality(&intent, finality)?;
+        let sealed = self.verify_and_prepare_with_role(&intent, finality, joiner)?;
         if let Some(existing) = self.agents.get(&agent) {
             if existing.intent != intent {
                 return Err(SharedAgentHostError::Conflict);
@@ -5363,16 +5405,52 @@ impl SharedAgentHost {
         intent: &SharedGenesisIntent,
         finality: &dyn AgentGenesisFinalityVerifier,
     ) -> Result<PreparedSharedGenesis, SharedAgentHostError> {
+        self.verify_and_prepare_with_role(intent, finality, false)
+    }
+
+    /// Like `verify_and_prepare_with_finality`; `allow_joiner` additionally
+    /// seals an ordinary generation for a local node outside its genesis
+    /// committee. Only explicit joiner provisioning and the reopen of an
+    /// already retained intent pass it.
+    fn verify_and_prepare_with_role(
+        &self,
+        intent: &SharedGenesisIntent,
+        finality: &dyn AgentGenesisFinalityVerifier,
+        allow_joiner: bool,
+    ) -> Result<PreparedSharedGenesis, SharedAgentHostError> {
         intent.validate()?;
         match &intent.authority {
             SharedGenesisAuthority::AuthorityFinalized(provision) => {
                 let verified = VerifiedAgentGenesisProvision::verify(provision.clone(), finality)
                     .map_err(map_provision_verification_error)?;
-                let member = verified
+                let Some(member) = verified
                     .provision()
                     .replicas()
                     .member_by_node(self.scope().node)
-                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                else {
+                    if !allow_joiner {
+                        return Err(SharedAgentHostError::ScopeMismatch);
+                    }
+                    #[cfg(feature = "experimental-state-blocks")]
+                    if verified
+                        .provision()
+                        .proposal()
+                        .create()
+                        .runtime
+                        .is_external_state()
+                    {
+                        return Err(SharedAgentHostError::InvalidProvision);
+                    }
+                    return LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_shared_joiner_genesis(
+                        &verified,
+                        joiner_storage_replica(self.scope().node),
+                        &intent.catalog,
+                        Arc::clone(&self.trust),
+                        Arc::clone(&self.merge),
+                    )
+                    .map(PreparedSharedGenesis::AuthorityFinalized)
+                    .map_err(|_| SharedAgentHostError::InvalidProvision);
+                };
                 #[cfg(feature = "experimental-state-blocks")]
                 if verified
                     .provision()
@@ -5453,7 +5531,18 @@ impl SharedAgentHost {
             Database::create(self.raft_path(agent))
                 .map_err(|_| SharedAgentHostError::Unavailable)?,
         );
-        let ledger = AgentRaftApplicationLedgerV2::open(
+        // Only joiner provisioning (or the reopen of its retained intent)
+        // reaches here for a node outside the genesis committee.
+        let open = if intent
+            .committee()
+            .member_by_node(self.scope().node)
+            .is_some()
+        {
+            AgentRaftApplicationLedgerV2::open
+        } else {
+            AgentRaftApplicationLedgerV2::open_joiner
+        };
+        let ledger = open(
             database,
             generation,
             journal_store,
@@ -5890,7 +5979,19 @@ fn attachment_status_for(
         .network_committee_state()
         .map_err(map_driver_error)?;
     let committee = &committee_state.active;
-    let local_role = hosted.driver.local_role().map_err(map_driver_error)?;
+    let local_node = hosted.driver.ledger().local_node();
+    let named_next = committee_state
+        .next
+        .as_ref()
+        .is_some_and(|next| next.member_by_node(local_node).is_some());
+    // An explicit joiner outside the active committee replays the log as a
+    // passive observer: it is not a member until the stable leg names it.
+    let joiner = hosted.driver.ledger().is_joiner();
+    let local_role = match hosted.driver.local_role().map_err(map_driver_error)? {
+        None if joiner => Some(ReplicaRole::Observer),
+        role => role,
+    };
+    let joining = joiner && committee.member_by_node(local_node).is_none() && !named_next;
     let replica_route = |member: &super::genesis::AgentReplicaMember| SharedReplicaRoute {
         node: member.replica().node,
         role: member.replica().role,
@@ -5919,7 +6020,19 @@ fn attachment_status_for(
         } else {
             SharedAgentTransportState::NotAttached
         },
+        joining,
     })
+}
+
+/// Local storage identity of a joiner's journal. It fixes the node owning the
+/// journal heads and Local lane; it is never a roster entry; the authority-
+/// signed committee change names the joiner's real principal and role.
+fn joiner_storage_replica(node: NodeId) -> super::AgentReplica {
+    super::AgentReplica {
+        node,
+        principal: crate::service::PrincipalId(node.0),
+        role: ReplicaRole::Observer,
+    }
 }
 
 fn map_apply_outcome(outcome: SharedPhysicalApplyOutcome) -> SharedAgentApplyOutcome {
@@ -12616,6 +12729,8 @@ mod tests {
             expected_generation: fixture.descriptor.replica_generation(),
             replicas: grown.clone(),
         };
+        // Every management decision needs a strictly later observed slot.
+        slot.store(21, Ordering::SeqCst);
         let change_receipt =
             clean_management_receipt(&fixture.descriptor, &change, 3, &fixture.authority_key);
         let expected_generation = crate::agent_sdk::replica_set_generation(
@@ -12695,6 +12810,7 @@ mod tests {
             actor: entry.actor,
             expected_deployment: entry.deployment,
         };
+        slot.store(22, Ordering::SeqCst);
         let suspend_receipt =
             clean_management_receipt(&fixture.descriptor, &suspend, 4, &fixture.authority_key);
         assert!(matches!(
@@ -12740,254 +12856,532 @@ mod tests {
         }
     }
 
-    /// From one voter, grow to three, then replace every original voter one
-    /// at a time by a spare replica while ordered mutations keep committing.
-    /// Every acknowledged mutation survives each replacement and the final
-    /// state commitment is identical on every surviving replica.
+    /// Receipt valid over a wide logical window, for long concurrent runs in
+    /// which every attempt observes a strictly later slot.
+    #[cfg(feature = "pvm")]
+    fn wide_management_receipt(
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        request: &crate::agent_sdk::ManagementRequest,
+        sequence: u64,
+        epoch: u64,
+        authority_key: &SigningKey,
+    ) -> crate::agent_sdk::authority::AuthorityReceipt {
+        let mut receipt = clean_management_receipt(descriptor, request, sequence, authority_key);
+        receipt.selector.epoch = epoch;
+        receipt.selector.expires_at = 1_000_000;
+        receipt.signature = authority_key.sign(&receipt.signing_bytes()).to_bytes();
+        receipt.validate_shape().unwrap();
+        receipt
+    }
+
+    /// Connect a newly started node to every live node of the mesh.
+    #[cfg(feature = "network")]
+    fn join_mesh(network: &crate::network::Network, live: &[&Arc<crate::network::Network>]) {
+        for peer in live {
+            network.connect(
+                peer.listen_addrs()[0]
+                    .clone()
+                    .with(libp2p::multiaddr::Protocol::P2p(peer.peer_id())),
+            );
+        }
+    }
+
+    /// One ordered mutation attempt on whichever live replica leads. `Ok`
+    /// carries a definitive submission; `Err` means no replica completed it.
+    #[cfg(feature = "network")]
+    fn manage_once(
+        attachments: &Mutex<Vec<Option<crate::network::SharedAgentNetworkHost>>>,
+        agent: AgentId,
+        request: &crate::agent_sdk::ManagementRequest,
+        receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+        joining: &[Vec<u8>],
+    ) -> Result<crate::network::shared_agent::CleanManagementSubmission, SharedAgentHostError> {
+        let mut attachments = attachments.lock().unwrap();
+        let mut last = SharedAgentHostError::Unavailable;
+        for attachment in attachments.iter_mut().flatten() {
+            let _ = attachment.refresh();
+            match attachment.manage_clean_with_replicas(
+                agent,
+                request.clone(),
+                receipt.clone(),
+                joining,
+            ) {
+                Ok(done) => return Ok(done),
+                Err(error) => last = error,
+            }
+        }
+        Err(last)
+    }
+
+    /// Grow one voter to three with brand-new nodes (fresh keys, empty
+    /// stores) while ordered mutations run concurrently, then replace a
+    /// killed voter with another brand-new node. Every acknowledged mutation
+    /// is retained with its exact result on every voter, and the replicated
+    /// state commitment is identical on all of them.
     ///
-    /// Spares are observers of the initial committee: a node outside it
-    /// cannot open the generation on this branch (see the gap report).
+    /// A second replacement is refused, not wedged: vos-raft starts no new
+    /// membership change until every removed voter acknowledges its final
+    /// configuration, which a dead voter never does.
     #[cfg(all(feature = "network", feature = "pvm"))]
     #[test]
-    fn signed_change_replicas_replaces_every_voter_without_losing_state() {
+    fn fresh_joiners_grow_and_replace_voters_under_concurrent_mutations() {
         use crate::network::shared_agent::CleanManagementSubmission;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
 
-        let seeds = [0x31_u8, 0x32, 0x33, 0x34, 0x35, 0x36];
-        let mut initial = vec![(0x31, ReplicaRole::Voter)];
-        initial.extend(seeds[1..].iter().map(|seed| (*seed, ReplicaRole::Observer)));
-        let fixture = committee_change_fixture(0x5b, &initial);
+        const GENESIS: u8 = 0x31;
+        let fixture = committee_change_fixture(0x5b, &[(GENESIS, ReplicaRole::Voter)]);
         let agent = fixture.agent;
         let authority = descriptor_committee_authority(&fixture.descriptor);
         let slot = Arc::new(AtomicU64::new(20));
-        let directories = seeds
-            .iter()
-            .map(|seed| TempDirectory::new(&format!("committee_rotate_{seed:02x}")))
-            .collect::<Vec<_>>();
-        let mut hosts = seeds
-            .iter()
-            .zip(&directories)
-            .map(|(seed, directory)| {
+        let sequence = Arc::new(AtomicU64::new(1));
+        let epoch = Arc::new(AtomicU64::new(1));
+        let next_receipt = |request: &crate::agent_sdk::ManagementRequest, epoch: u64| {
+            slot.fetch_add(1, Ordering::SeqCst);
+            wide_management_receipt(
+                &fixture.descriptor,
+                request,
+                sequence.fetch_add(1, Ordering::SeqCst) + 1,
+                epoch,
+                &fixture.authority_key,
+            )
+        };
+
+        // Node registry: seed -> (store, host, network). Index i of every
+        // vector belongs to the same node; `None` once the node is lost.
+        let mut seeds = vec![GENESIS];
+        let mut directories = vec![TempDirectory::new("fresh_joiner_genesis")];
+        let mut hosts = vec![Some(Arc::new(Mutex::new({
+            let mut host = open_native_clean_host_for_seed(
+                &directories[0],
+                &fixture,
+                GENESIS,
+                Arc::clone(&slot),
+            );
+            host.provision(
+                fixture.provision.clone(),
+                fixture.catalog.clone(),
+                authority,
+            )
+            .unwrap();
+            host
+        })))];
+        let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+        let mut networks = vec![Some(live_network(GENESIS, vec![listen.clone()]))];
+        let attachments = Arc::new(Mutex::new(vec![Some(
+            crate::network::SharedAgentNetworkHost::attach(
+                Arc::clone(hosts[0].as_ref().unwrap()),
+                Arc::clone(networks[0].as_ref().unwrap()),
+            )
+            .unwrap(),
+        )]));
+
+        // A fresh node: new key, new empty store, explicit joiner provision.
+        let start_joiner =
+            |seed: u8,
+             seeds: &mut Vec<u8>,
+             directories: &mut Vec<TempDirectory>,
+             hosts: &mut Vec<Option<Arc<Mutex<SharedAgentHost>>>>,
+             networks: &mut Vec<Option<Arc<crate::network::Network>>>| {
+                let directory = TempDirectory::new(&format!("fresh_joiner_{seed:02x}"));
                 let mut host =
-                    open_native_clean_host_for_seed(directory, &fixture, *seed, Arc::clone(&slot));
-                host.provision(
-                    fixture.provision.clone(),
-                    fixture.catalog.clone(),
-                    authority,
+                    open_native_clean_host_for_seed(&directory, &fixture, seed, Arc::clone(&slot));
+                assert_eq!(
+                    host.provision(
+                        fixture.provision.clone(),
+                        fixture.catalog.clone(),
+                        authority
+                    )
+                    .unwrap_err(),
+                    SharedAgentHostError::ScopeMismatch,
+                    "the default path never admits a non-member"
+                );
+                let status = host
+                    .provision_joiner(
+                        fixture.provision.clone(),
+                        fixture.catalog.clone(),
+                        authority,
+                    )
+                    .unwrap();
+                assert_eq!(status.local_role, Some(ReplicaRole::Observer));
+                assert!(
+                    status.replicas.iter().all(|replica| replica.node
+                        != NodeId::of_authenticated_peer(&peer_id(&key(seed))))
+                );
+                let host = Arc::new(Mutex::new(host));
+                let network = live_network(seed, vec![listen.clone()]);
+                assert!(wait_until(std::time::Duration::from_secs(5), || {
+                    !network.listen_addrs().is_empty()
+                }));
+                join_mesh(&network, &networks.iter().flatten().collect::<Vec<_>>());
+                let attachment = crate::network::SharedAgentNetworkHost::attach(
+                    Arc::clone(&host),
+                    Arc::clone(&network),
                 )
                 .unwrap();
-                Some(Arc::new(Mutex::new(host)))
-            })
-            .collect::<Vec<_>>();
-        let mut networks = live_mesh(&seeds).into_iter().map(Some).collect::<Vec<_>>();
-        let attachments = hosts
-            .iter()
-            .zip(&networks)
-            .map(|(host, network)| {
-                Some(
-                    crate::network::SharedAgentNetworkHost::attach(
-                        Arc::clone(host.as_ref().unwrap()),
-                        Arc::clone(network.as_ref().unwrap()),
-                    )
-                    .unwrap(),
-                )
-            })
-            .collect::<Vec<_>>();
+                assert!(
+                    attachment.attachment_for_test(agent).unwrap().1,
+                    "passive worker"
+                );
+                attachments.lock().unwrap().push(Some(attachment));
+                seeds.push(seed);
+                directories.push(directory);
+                hosts.push(Some(host));
+                networks.push(Some(network));
+            };
 
+        // Install one actor, then keep toggling it from a background thread.
         let actor_package = super::super::package_admission::admitted_standard_query_actor_for_test(
-            "committee-rotate-worker",
+            "fresh-joiner-worker",
             crate::agent_sdk::StateLane::Linear,
             0x77,
         );
-        let mut sequence = 2;
-        let mut epoch = 1;
-        let mut descriptor = fixture.descriptor.clone();
         let install = clean_install_request(fixture.descriptor.identity.agent, &actor_package);
-        let install_receipt =
-            clean_management_receipt(&descriptor, &install, sequence, &fixture.authority_key);
-        sequence += 1;
-        let mut owned = attachments;
-        let CleanManagementSubmission::Applied {
-            outcome:
-                crate::agent_sdk::RuntimeOutcome::Management(Ok(
-                    crate::agent_sdk::ManagementReply::Installed(entry),
-                )),
-            ..
-        } = manage_live(
-            &mut owned,
-            agent,
-            &install,
-            &install_receipt,
-            SdkManagementArtifacts::Actor(&actor_package),
-        )
-        else {
-            panic!("single-voter Install did not apply")
-        };
-        let mut acknowledged = Vec::new();
-        let mut suspended = false;
-
-        // (0) grow to three voters; (1..=3) replace each original voter.
-        let mut voters = vec![0x31_u8];
-        let mut spares = seeds[1..].to_vec();
-        let mut retired = Vec::new();
-        for step in 0..4 {
-            let removed = (step > 0).then(|| voters.remove(0));
-            if let Some(removed) = removed {
-                // The replaced voter is lost: its task and store are gone.
-                let index = seeds.iter().position(|seed| *seed == removed).unwrap();
-                drop(owned[index].take());
-                drop(hosts[index].take());
-                join_live_network(networks[index].take().unwrap());
-                retired.push(removed);
-            }
-            while voters.len() < 3 {
-                voters.push(spares.remove(0));
-            }
-            let mut members = voters
-                .iter()
-                .map(|seed| (*seed, ReplicaRole::Voter))
-                .collect::<Vec<_>>();
-            members.extend(spares.iter().map(|seed| (*seed, ReplicaRole::Observer)));
-            let roster = seeded_roster(&members);
-            let change = crate::agent_sdk::ManagementRequest::ChangeReplicas {
-                expected_generation: descriptor.replica_generation(),
-                replicas: roster.clone(),
-            };
-            // Each stable committee leg advances the ledger's authority epoch;
-            // later decisions keep the epoch of the change they follow.
-            let decision_epoch = epoch;
-            let change_receipt = epoch_management_receipt(
-                &descriptor,
-                &change,
-                sequence,
-                decision_epoch,
-                &fixture.authority_key,
-            );
-            sequence += 1;
-            epoch += 1;
-            assert!(
-                matches!(
-                    manage_live(
-                        &mut owned,
+        let install_receipt = next_receipt(&install, 1);
+        let entry = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let result = {
+                    let mut attachments = attachments.lock().unwrap();
+                    let attachment = attachments[0].as_mut().unwrap();
+                    let _ = attachment.refresh();
+                    attachment.manage_clean(
                         agent,
-                        &change,
-                        &change_receipt,
-                        SdkManagementArtifacts::None,
-                    ),
-                    CleanManagementSubmission::Applied {
-                        outcome: crate::agent_sdk::RuntimeOutcome::Management(Ok(
-                            crate::agent_sdk::ManagementReply::ReplicasChanged { .. }
+                        install.clone(),
+                        install_receipt.clone(),
+                        SdkManagementArtifacts::Actor(&actor_package),
+                    )
+                };
+                if let Ok(CleanManagementSubmission::Applied {
+                    outcome:
+                        crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                            crate::agent_sdk::ManagementReply::Installed(entry),
                         )),
-                        ..
-                    }
-                ),
-                "step {step} replica change did not complete"
-            );
-            descriptor.replicas = roster.clone();
-
-            // An ordered mutation commits on the new committee.
-            let request = if suspended {
-                crate::agent_sdk::ManagementRequest::Resume {
-                    actor: entry.actor,
-                    expected_deployment: entry.deployment,
+                    ..
+                }) = result
+                {
+                    break entry;
                 }
-            } else {
-                crate::agent_sdk::ManagementRequest::Suspend {
-                    actor: entry.actor,
-                    expected_deployment: entry.deployment,
-                }
-            };
-            let receipt = epoch_management_receipt(
-                &descriptor,
-                &request,
-                sequence,
-                decision_epoch,
-                &fixture.authority_key,
-            );
-            sequence += 1;
-            let outcome = manage_live(
-                &mut owned,
-                agent,
-                &request,
-                &receipt,
-                SdkManagementArtifacts::None,
-            );
-            assert!(
-                matches!(
-                    &outcome,
-                    CleanManagementSubmission::Applied {
-                        outcome: crate::agent_sdk::RuntimeOutcome::Management(Ok(_)),
-                        new_slot: true,
-                        ..
-                    }
-                ),
-                "step {step} ordered mutation was not acknowledged"
-            );
-            suspended = !suspended;
-            acknowledged.push((request, receipt));
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Install: {:?}",
+                    result.err()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        };
 
-            // Spare observers receive nothing until a joint configuration
-            // names them, so convergence is asserted on the voters.
-            let voter_hosts = voters
-                .iter()
-                .map(|seed| {
-                    hosts[seeds
-                        .iter()
-                        .position(|candidate| candidate == seed)
-                        .unwrap()]
-                    .as_ref()
-                    .unwrap()
-                })
-                .collect::<Vec<_>>();
-            assert!(
-                wait_until(std::time::Duration::from_secs(30), || {
-                    owned.iter_mut().flatten().for_each(|attachment| {
-                        let _ = attachment.refresh();
+        let stop = Arc::new(AtomicBool::new(false));
+        let phase = Arc::new(AtomicUsize::new(0));
+        // Phase of the most recent acknowledgement, plus one (0: none yet).
+        let last_ack = Arc::new(AtomicUsize::new(0));
+        let mutations = {
+            let attachments = Arc::clone(&attachments);
+            let stop = Arc::clone(&stop);
+            let phase = Arc::clone(&phase);
+            let last_ack = Arc::clone(&last_ack);
+            let entry = entry.clone();
+            let slot = Arc::clone(&slot);
+            let sequence = Arc::clone(&sequence);
+            let epoch = Arc::clone(&epoch);
+            let descriptor = fixture.descriptor.clone();
+            let authority_key = fixture.authority_key.clone();
+            std::thread::spawn(move || {
+                let mut acknowledged = Vec::new();
+                let mut suspended = false;
+                let mut pending: Option<(
+                    crate::agent_sdk::ManagementRequest,
+                    crate::agent_sdk::authority::AuthorityReceipt,
+                )> = None;
+                while !stop.load(Ordering::Acquire) {
+                    let (request, receipt) = pending.take().unwrap_or_else(|| {
+                        let request = if suspended {
+                            crate::agent_sdk::ManagementRequest::Resume {
+                                actor: entry.actor,
+                                expected_deployment: entry.deployment,
+                            }
+                        } else {
+                            crate::agent_sdk::ManagementRequest::Suspend {
+                                actor: entry.actor,
+                                expected_deployment: entry.deployment,
+                            }
+                        };
+                        let receipt = wide_management_receipt(
+                            &descriptor,
+                            &request,
+                            sequence.fetch_add(1, Ordering::SeqCst) + 1,
+                            epoch.load(Ordering::SeqCst),
+                            &authority_key,
+                        );
+                        (request, receipt)
                     });
-                    committee_converged(&voter_hosts, agent, &roster)
-                }),
-                "step {step} did not converge"
-            );
-            // Every acknowledged mutation is still in the replicated state.
-            for host in &voter_hosts {
-                let (_, _, actors) = replicated_state(host, agent).unwrap();
-                let record = actors
-                    .entries
+                    slot.fetch_add(1, Ordering::SeqCst);
+                    match manage_once(&attachments, agent, &request, &receipt, &[]) {
+                        Ok(CleanManagementSubmission::Applied {
+                            outcome: outcome @ crate::agent_sdk::RuntimeOutcome::Management(Ok(_)),
+                            ..
+                        }) => {
+                            suspended = !suspended;
+                            let acknowledged_phase = phase.load(Ordering::Acquire);
+                            acknowledged.push((acknowledged_phase, request, receipt, outcome));
+                            last_ack.store(acknowledged_phase + 1, Ordering::Release);
+                        }
+                        // A definitive refusal consumed nothing that could later
+                        // apply: sign a fresh decision (sequence/slot races with
+                        // the replica change are expected).
+                        Ok(_) => {}
+                        // Not definitive (no leader, transition barrier, fence,
+                        // lost reply): retry the exact same decision, which is
+                        // idempotent if it did commit.
+                        Err(_) => pending = Some((request, receipt)),
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                (acknowledged, suspended)
+            })
+        };
+
+        // Drive one replica change on the current leader. A refused
+        // descriptor leg (raced by a concurrent decision) is re-signed.
+        let drive_change = |roster: &[crate::agent_sdk::AgentReplica],
+                            expected_generation: crate::agent_sdk::Hash,
+                            change_epoch: u64,
+                            joining: &[Vec<u8>]| {
+            let change = crate::agent_sdk::ManagementRequest::ChangeReplicas {
+                expected_generation,
+                replicas: roster.to_vec(),
+            };
+            let mut receipt = next_receipt(&change, change_epoch);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                slot.fetch_add(1, Ordering::SeqCst);
+                match manage_once(&attachments, agent, &change, &receipt, joining) {
+                    Ok(CleanManagementSubmission::Applied {
+                        outcome:
+                            crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                                crate::agent_sdk::ManagementReply::ReplicasChanged { .. },
+                            )),
+                        ..
+                    }) => return,
+                    Ok(CleanManagementSubmission::CommitteeTransition { .. }) | Err(_) => {}
+                    Ok(_) => receipt = next_receipt(&change, change_epoch),
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "replica change to {roster:?} did not complete"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        };
+        let live_voters =
+            |hosts: &[Option<Arc<Mutex<SharedAgentHost>>>], seeds: &[u8], voters: &[u8]| {
+                voters
                     .iter()
-                    .find(|record| record.entry.actor == entry.actor)
-                    .expect("installed actor survives replacement");
-                assert_eq!(record.entry.suspended, suspended);
+                    .map(|seed| {
+                        Arc::clone(
+                            hosts[seeds
+                                .iter()
+                                .position(|candidate| candidate == seed)
+                                .unwrap()]
+                            .as_ref()
+                            .unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+        let converge = |voters: &[Arc<Mutex<SharedAgentHost>>],
+                        roster: &[crate::agent_sdk::AgentReplica]| {
+            let voters = voters.iter().collect::<Vec<_>>();
+            assert!(
+                wait_until(std::time::Duration::from_secs(60), || {
+                    attachments
+                        .lock()
+                        .unwrap()
+                        .iter_mut()
+                        .flatten()
+                        .for_each(|attachment| {
+                            let _ = attachment.refresh();
+                        });
+                    committee_converged(&voters, agent, roster)
+                }),
+                "voters did not converge on {roster:?}"
+            );
+        };
+
+        // Wait until a mutation is acknowledged in `wanted`, which also proves
+        // a leader exists among the live voters.
+        let await_ack = |wanted: usize| {
+            assert!(
+                wait_until(std::time::Duration::from_secs(60), || {
+                    last_ack.load(Ordering::Acquire) == wanted + 1
+                }),
+                "no mutation acknowledged in phase {wanted}"
+            );
+        };
+        await_ack(0);
+
+        // (1) Grow 1 -> 3 with two brand-new nodes.
+        for seed in [0x61, 0x62] {
+            start_joiner(
+                seed,
+                &mut seeds,
+                &mut directories,
+                &mut hosts,
+                &mut networks,
+            );
+        }
+        let joining = [peer_id(&key(0x61)), peer_id(&key(0x62))];
+        let grown = seeded_roster(&[
+            (GENESIS, ReplicaRole::Voter),
+            (0x61, ReplicaRole::Voter),
+            (0x62, ReplicaRole::Voter),
+        ]);
+        phase.store(1, Ordering::Release);
+        drive_change(&grown, fixture.descriptor.replica_generation(), 1, &joining);
+        epoch.store(2, Ordering::SeqCst);
+        let mut voters = vec![GENESIS, 0x61, 0x62];
+        converge(&live_voters(&hosts, &seeds, &voters), &grown);
+        let grown_generation = crate::agent_sdk::replica_set_generation(
+            &fixture.descriptor.identity,
+            fixture.descriptor.creation_nonce,
+            &grown,
+        );
+
+        // (2) Kill a voter, wait for a leader among the survivors, then
+        // replace it with a brand-new node.
+        let kill = |seed: u8,
+                    seeds: &[u8],
+                    hosts: &mut Vec<Option<Arc<Mutex<SharedAgentHost>>>>,
+                    networks: &mut Vec<Option<Arc<crate::network::Network>>>| {
+            let index = seeds
+                .iter()
+                .position(|candidate| *candidate == seed)
+                .unwrap();
+            drop(attachments.lock().unwrap()[index].take());
+            drop(hosts[index].take());
+            join_live_network(networks[index].take().unwrap());
+        };
+        await_ack(1);
+        kill(0x62, &seeds, &mut hosts, &mut networks);
+        voters.retain(|seed| *seed != 0x62);
+        phase.store(2, Ordering::Release);
+        // Never change membership across a leader change: wait for the
+        // survivors to elect a leader and commit before starting the change.
+        await_ack(2);
+        start_joiner(
+            0x63,
+            &mut seeds,
+            &mut directories,
+            &mut hosts,
+            &mut networks,
+        );
+        let replaced = seeded_roster(&[
+            (GENESIS, ReplicaRole::Voter),
+            (0x61, ReplicaRole::Voter),
+            (0x63, ReplicaRole::Voter),
+        ]);
+        drive_change(&replaced, grown_generation, 2, &[peer_id(&key(0x63))]);
+        epoch.store(3, Ordering::SeqCst);
+        voters.push(0x63);
+        converge(&live_voters(&hosts, &seeds, &voters), &replaced);
+        let replaced_generation = crate::agent_sdk::replica_set_generation(
+            &fixture.descriptor.identity,
+            fixture.descriptor.creation_nonce,
+            &replaced,
+        );
+        phase.store(3, Ordering::Release);
+        await_ack(3);
+
+        // (3) The next replacement is refused before any slot is used: the
+        // removed voter never acknowledges its retirement.
+        kill(0x61, &seeds, &mut hosts, &mut networks);
+        voters.retain(|seed| *seed != 0x61);
+        phase.store(4, Ordering::Release);
+        // Two of three voters still elect and commit.
+        await_ack(4);
+        start_joiner(
+            0x64,
+            &mut seeds,
+            &mut directories,
+            &mut hosts,
+            &mut networks,
+        );
+        let blocked = crate::agent_sdk::ManagementRequest::ChangeReplicas {
+            expected_generation: replaced_generation,
+            replicas: seeded_roster(&[
+                (GENESIS, ReplicaRole::Voter),
+                (0x63, ReplicaRole::Voter),
+                (0x64, ReplicaRole::Voter),
+            ]),
+        };
+        let blocked_receipt = next_receipt(&blocked, 3);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            slot.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                manage_once(
+                    &attachments,
+                    agent,
+                    &blocked,
+                    &blocked_receipt,
+                    &[peer_id(&key(0x64))],
+                )
+                .is_err(),
+                "a membership change with an unacknowledged retirement must be refused"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let survivors = live_voters(&hosts, &seeds, &voters);
+        for host in &survivors {
+            assert_eq!(
+                host.lock()
+                    .unwrap()
+                    .show(agent)
+                    .unwrap()
+                    .unwrap()
+                    .committee_transition,
+                None,
+                "a refused change leaves no prepared transition behind"
+            );
+        }
+        stop.store(true, Ordering::Release);
+        let (acknowledged, suspended) = mutations.join().unwrap();
+        for wanted in 0..=4 {
+            assert!(
+                acknowledged.iter().any(|(phase, ..)| *phase == wanted),
+                "no mutation was acknowledged in phase {wanted}"
+            );
+        }
+        converge(&survivors, &replaced);
+
+        // No acknowledged mutation is lost: each exact decision is retained
+        // with its acknowledged result on every surviving voter, and the
+        // final directory reflects the last acknowledged toggle.
+        for host in &survivors {
+            let mut host = host.lock().unwrap();
+            for (_, request, receipt, outcome) in &acknowledged {
+                let prepared = host
+                    .prepare_clean_management(
+                        agent,
+                        request.clone(),
+                        receipt.clone(),
+                        SdkManagementArtifacts::None,
+                    )
+                    .unwrap();
+                assert_eq!(prepared.retained(), Some(outcome));
             }
         }
-        assert_eq!(retired, vec![0x31, 0x32, 0x33]);
-        assert_eq!(voters, vec![0x34, 0x35, 0x36]);
-        assert!(spares.is_empty());
-
-        // Each acknowledged result is replayable from the final committee:
-        // the exact request and receipt are retained, never applied twice.
-        let (before, history, _) = replicated_state(hosts[3].as_ref().unwrap(), agent).unwrap();
-        if let Some((request, receipt)) = acknowledged.last() {
-            assert!(matches!(
-                manage_live(
-                    &mut owned,
-                    agent,
-                    request,
-                    receipt,
-                    SdkManagementArtifacts::None,
-                ),
-                CleanManagementSubmission::Applied {
-                    new_slot: false,
-                    ..
-                }
-            ));
-        }
-        let survivors = hosts.iter().flatten().collect::<Vec<_>>();
         for host in &survivors {
-            let (position, survivor_history, _) = replicated_state(host, agent).unwrap();
-            assert_eq!(position, before);
-            assert_eq!(survivor_history, history);
+            let (_, _, actors) = replicated_state(host, agent).unwrap();
+            let record = actors
+                .entries
+                .iter()
+                .find(|record| record.entry.actor == entry.actor)
+                .expect("installed actor survives every replacement");
+            assert_eq!(record.entry.suspended, suspended);
         }
+
         drop(survivors);
-        drop(owned);
+        drop(attachments);
         drop(hosts);
         for network in networks.into_iter().flatten() {
             join_live_network(network);

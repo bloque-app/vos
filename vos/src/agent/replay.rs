@@ -3612,9 +3612,48 @@ pub(crate) struct ReplaySealedSharedGenesis {
     admission_record: AgentGenesisAdmissionRecord,
     committee: AgentReplicaCommittee,
     replica: AgentReplica,
+    /// The local replica is outside the genesis committee. Such a seal is
+    /// minted only by an explicit joiner open: the replica stores the same
+    /// verified genesis and receives authority only through a later
+    /// authority-signed committee change.
+    joiner: bool,
 }
 
 impl ReplaySealedSharedGenesis {
+    /// Seal a verified provision for a local replica outside its genesis
+    /// committee. The genesis, admission and committee are exactly those of
+    /// `from_prepared_verified`; only the local storage identity differs.
+    pub(crate) fn joiner_from_prepared_verified(
+        verified: &VerifiedAgentGenesisProvision,
+        prepared: ReplayPreparedGenesis,
+        joiner: AgentReplica,
+    ) -> Result<Self, ReplayValidationError> {
+        let mut sealed = Self::from_prepared_verified(verified, prepared)?;
+        if joiner.node == NodeId::ZERO
+            || joiner.principal == crate::service::PrincipalId::ZERO
+            || sealed.committee.member_by_node(joiner.node).is_some()
+        {
+            return Err(ReplayError::ScopeMismatch);
+        }
+        sealed.local_invocations = InvocationIndexManifest::empty(
+            sealed.genesis.id(),
+            InvocationOwnershipScope::Local(joiner.node),
+        );
+        sealed.replica = joiner;
+        sealed.joiner = true;
+        sealed.validate()?;
+        Ok(sealed)
+    }
+
+    /// The local replica is the exact genesis member, or an explicit joiner
+    /// that is not a genesis member at all.
+    fn replica_admitted(&self) -> bool {
+        match self.committee.member_by_node(self.replica.node) {
+            Some(member) => !self.joiner && member.replica() == self.replica,
+            None => self.joiner,
+        }
+    }
+
     pub(crate) fn from_prepared_verified(
         verified: &VerifiedAgentGenesisProvision,
         prepared: ReplayPreparedGenesis,
@@ -3704,6 +3743,7 @@ impl ReplaySealedSharedGenesis {
             admission_record,
             committee: committee.clone(),
             replica,
+            joiner: false,
         };
         sealed.validate()?;
         Ok(sealed)
@@ -3812,11 +3852,7 @@ impl ReplaySealedSharedGenesis {
                 AgentGenesisAdmissionRecord::SystemAuthorized { .. }
             )
             || !validates_shared_create_committee(&self.genesis.create, &self.committee)
-            || self
-                .committee
-                .member_by_node(self.replica.node)
-                .map(|member| member.replica())
-                != Some(self.replica)
+            || !self.replica_admitted()
             || self.artifacts.genesis != self.genesis.id()
             || self.empty_frontier.genesis != self.genesis.id()
             || !self.empty_frontier.events.is_empty()
@@ -4035,11 +4071,7 @@ impl ReplaySealedOrdinaryGenesis for ReplaySealedSharedGenesis {
     fn validates_post_create_state(&self) -> bool {
         !self.post_create.is_empty()
             && validates_shared_create_committee(&self.genesis.create, &self.committee)
-            && self
-                .committee
-                .member_by_node(self.replica.node)
-                .map(|member| member.replica())
-                == Some(self.replica)
+            && self.replica_admitted()
     }
 
     fn admission_record(&self) -> Option<&AgentGenesisAdmissionRecord> {

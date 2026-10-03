@@ -5527,6 +5527,65 @@ where
         })
     }
 
+    /// Seal one independently finalized Shared provision for an explicit
+    /// joiner: a local replica outside the genesis committee. Create is
+    /// re-executed exactly as for a member (its result does not depend on the
+    /// local replica); only the local storage identity is the joiner's.
+    pub(crate) fn prepare_shared_joiner_genesis(
+        verified: &VerifiedAgentGenesisProvision,
+        joiner: AgentReplica,
+        catalog: &[RuntimeBlob],
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<ReplaySealedSharedGenesis, LocalJournalDriverError> {
+        let provision = verified.provision();
+        let committee = provision.replicas();
+        let Some(member) = committee.members().first().map(|member| member.replica()) else {
+            return Err(LocalReplayExecutorError::WrongReplica.into());
+        };
+        if joiner.node != merge.node()
+            || committee.validate().is_err()
+            || committee.member_by_node(joiner.node).is_some()
+            || !super::replay::validates_shared_create_committee(
+                provision.proposal().create(),
+                committee,
+            )
+        {
+            return Err(LocalReplayExecutorError::WrongReplica.into());
+        }
+        let supplied = SuppliedCatalogBlobResolver::from_catalog(catalog)?;
+        let expected_catalog = supplied.blobs.clone();
+        let mut executor = StandardLocalReplayExecutor::new_shared(
+            supplied,
+            trust,
+            merge,
+            vec![committee.clone()],
+        );
+        let prepared = ReplayPreparedGenesis::prepare(
+            provision.proposal().create().clone(),
+            member,
+            &mut executor,
+        )
+        .map_err(lift_prepared_genesis_error)?;
+        if expected_catalog.len() != prepared.artifacts().len()
+            || prepared.artifacts().iter().any(|reference| {
+                expected_catalog
+                    .get(&(reference.hash, reference.len))
+                    .is_none_or(|bytes| !reference.matches(bytes))
+            })
+        {
+            return Err(LocalJournalDriverError::InvalidResult);
+        }
+        ReplaySealedSharedGenesis::joiner_from_prepared_verified(verified, prepared, joiner)
+            .map_err(|error| {
+                LocalJournalDriverError::Replay(
+                    error
+                        .map_source(|never| match never {})
+                        .map_executor(|never| match never {}),
+                )
+            })
+    }
+
     /// Execute an ordinary Shared Create before genesis certification. The
     /// returned opaque candidate can derive a proposal but cannot initialize
     /// a journal: only independent finality verification can mint that seal.
