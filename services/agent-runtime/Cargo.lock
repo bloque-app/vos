@@ -388,6 +388,7 @@ name = "vos"
 version = "0.1.0"
 dependencies = [
  "blake2b_simd",
+ "curve25519-dalek",
  "ed25519-dalek",
  "log",
  "rkyv",
