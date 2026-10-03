@@ -26,6 +26,8 @@ pub mod authority_operation_issuer;
 pub mod bootstrap;
 pub mod catalog_finality;
 #[cfg(feature = "std")]
+pub mod checkpoint_archive;
+#[cfg(feature = "std")]
 pub mod clean_authority_issuer;
 #[cfg(feature = "std")]
 pub mod clean_bootstrap;
