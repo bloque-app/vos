@@ -6760,6 +6760,9 @@ pub(crate) mod tests {
             ManagementRequest::ChangeReplicas { .. } => {
                 (AuthorityOperationKind::ChangeReplicaSet, None, None)
             }
+            ManagementRequest::SetExecutionLimits(_) => {
+                (AuthorityOperationKind::SetExecutionLimits, None, None)
+            }
             ManagementRequest::PrivateControl { control, .. } => match control.operation {
                 crate::agent_sdk::private::PrivateControlOperation::SetResourcePolicy {
                     ..
