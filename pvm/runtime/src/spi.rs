@@ -20,7 +20,13 @@ pub use vos_pvm_program::{Region as SpiRegion, StandardLayout, StandardProgram, 
 /// calls outside the standard inner-machine interface. Keeping the policy
 /// next to the standard-program decoder prevents a caller from accidentally
 /// inspecting a retired capability manifest under these rules.
+/// Refine's standard machine calls (9 to 14). Profile runtimes may also use
+/// [`REFINE_PROFILE_HOST_CALLS`].
 pub const REFINE_HOST_CALL_ALLOWLIST: [u64; 6] = [9, 10, 11, 12, 13, 14];
+/// Calls an agent-runtime profile may add: Gray Paper `historical_lookup` (7), served by
+/// the embedder from natively verified preimages, and the VOS BLAKE2b precompile (100),
+/// served by Refine itself.
+pub const REFINE_PROFILE_HOST_CALLS: [u64; 2] = [7, 100];
 
 /// Failure while inspecting a standard program's complete static host-call
 /// surface.
@@ -166,6 +172,13 @@ pub fn validate_standard_program_host_calls(
 /// serviced by [`crate::refine_host::RefineContext`].
 pub fn validate_refine_host_calls(blob: &[u8]) -> Result<(), HostCallInspectionError> {
     validate_standard_program_host_calls(blob, &REFINE_HOST_CALL_ALLOWLIST)
+}
+
+/// [`validate_refine_host_calls`], also admitting [`REFINE_PROFILE_HOST_CALLS`].
+pub fn validate_refine_profile_host_calls(blob: &[u8]) -> Result<(), HostCallInspectionError> {
+    let mut allowed = alloc::vec::Vec::from(REFINE_HOST_CALL_ALLOWLIST);
+    allowed.extend(REFINE_PROFILE_HOST_CALLS);
+    validate_standard_program_host_calls(blob, &allowed)
 }
 
 #[cfg(test)]

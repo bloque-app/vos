@@ -2,15 +2,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 fn digest<const N: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8; N] {
-    let mut state = blake2b_simd::Params::new().hash_length(N).to_state();
-    state.update(domain);
-    for part in parts {
-        state.update(part);
-    }
-    let hash = state.finalize();
-    let mut output = [0; N];
-    output.copy_from_slice(hash.as_bytes());
-    output
+    crate::blake2b::digest::<N>(domain, parts)
 }
 
 macro_rules! id_type {

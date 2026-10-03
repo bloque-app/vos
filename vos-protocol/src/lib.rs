@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+pub mod blake2b;
 mod identity;
 pub mod wire;
 

@@ -12,3 +12,8 @@ readme.workspace = true
 [dependencies]
 blake2b_simd = { version = "1", default-features = false }
 rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck"] }
+
+[features]
+# Compress through the VOS BLAKE2b precompile (ecalli 100) on a PVM guest. Only for an
+# infrastructure runtime whose outer Refine host services that call natively.
+outer-blake2b-precompile = []

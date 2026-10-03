@@ -33,6 +33,14 @@ actor-heap-16m = ["pvm"]
 # service runtime, but it uses only the standard PVM inner-machine surface.
 # Keep its larger transient arena out of ordinary application actors.
 agent-runtime = ["pvm", "dep:ed25519-dalek", "dep:curve25519-dalek"]
+# Runtime profiles (one transition semantics, two ways to authenticate actor programs):
+# the default "JAM-native" runtime receives each actor program in its work and verifies
+# it in the metered guest; `runtime-program-lookup` builds the "VOS-native" runtime,
+# which obtains the program by its ProgramId through Refine's historical_lookup (call 7)
+# from a host that verified the preimage natively. `runtime-blake2b-precompile` hashes
+# through the VOS precompile (ecalli 100) served natively by the outer Refine host.
+runtime-program-lookup = ["agent-runtime"]
+runtime-blake2b-precompile = ["agent-runtime", "vos-protocol/outer-blake2b-precompile"]
 experimental-state-blocks = ["vos-agent-sdk/experimental-state-blocks"]
 # Host-only enrollment cryptography and canonical Private control verification.
 # Shared genesis uses enrollment verification; this does not enable a Private

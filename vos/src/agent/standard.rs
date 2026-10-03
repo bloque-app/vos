@@ -178,6 +178,37 @@ fn installation_data_aliases_actor_artifact(
     })
 }
 
+/// Fetch an actor program by its ProgramId through Refine `historical_lookup` (call 7),
+/// from a host that verified the preimage natively (`vos_pvm::refine_host::
+/// serve_historical_lookup`). The allocation is leaked: it lives as long as this one
+/// execution's guest.
+#[cfg(all(feature = "runtime-program-lookup", target_arch = "riscv64"))]
+fn lookup_program(
+    program: &crate::agent_sdk::ProgramId,
+) -> Result<&'static [u8], crate::agent_sdk::InvocationError> {
+    use crate::agent_sdk::InvocationError;
+    const NONE: u64 = u64::MAX;
+    let hash = program.0;
+    let length = crate::abi::pvm::ecall::ecall5(7, NONE, hash.as_ptr() as u64, 0, 0, 0);
+    let length = usize::try_from(length)
+        .ok()
+        .filter(|length| *length != 0 && *length <= super::execution::MAX_EXECUTION_PROGRAM_BYTES)
+        .ok_or(InvocationError::InvalidAvailability)?;
+    let mut bytes = alloc::vec![0u8; length];
+    let written = crate::abi::pvm::ecall::ecall5(
+        7,
+        NONE,
+        hash.as_ptr() as u64,
+        bytes.as_mut_ptr() as u64,
+        0,
+        length as u64,
+    );
+    if written != length as u64 {
+        return Err(InvocationError::InvalidAvailability);
+    }
+    Ok(alloc::boxed::Box::leak(bytes.into_boxed_slice()))
+}
+
 fn install_matches(record: &ActorRecord, install: &super::InstallActor) -> bool {
     record.installation_id == install.installation_id
         && record.registry_reservation == install.registry_reservation
@@ -3122,7 +3153,9 @@ impl StandardAgentRuntime {
         // candidate is hashed to its ProgramId.
         let bound = self.bound_program_reference(actor_id);
         for (index, blob) in work.availability.iter().enumerate() {
-            let is_program = match bound {
+            // The VOS-native profile never receives the program as availability.
+            let is_program = !cfg!(all(feature = "runtime-program-lookup", target_arch = "riscv64"))
+                && match bound {
                 Some(reference) => {
                     blob.reference == *reference && blob.bytes.len() as u64 == reference.len
                 }
@@ -3183,7 +3216,16 @@ impl StandardAgentRuntime {
                 }
             }
         }
-        let program_index = program_index.ok_or(InvocationError::InvalidAvailability)?;
+        #[cfg(not(all(feature = "runtime-program-lookup", target_arch = "riscv64")))]
+        let program_bytes = {
+            let index = program_index.ok_or(InvocationError::InvalidAvailability)?;
+            work.availability[index].bytes.as_slice()
+        };
+        // VOS-native profile: the host supplies the program by its ProgramId through
+        // historical_lookup, having verified the preimage natively; the guest does not
+        // hash it. The bytes outlive this one execution's guest by design.
+        #[cfg(all(feature = "runtime-program-lookup", target_arch = "riscv64"))]
+        let program_bytes: &'work [u8] = lookup_program(&work.program)?;
         let schema_index = schema_index.ok_or(InvocationError::InvalidAvailability)?;
         let policy_index = policy_index.ok_or(InvocationError::InvalidAvailability)?;
         let installation_data_index = match (
@@ -3197,7 +3239,8 @@ impl StandardAgentRuntime {
             (None, None, None) => None,
             _ => return Err(InvocationError::InvalidAvailability),
         };
-        let mut role_indices = Vec::from([program_index, schema_index, policy_index]);
+        let mut role_indices = Vec::from([schema_index, policy_index]);
+        role_indices.extend(program_index);
         role_indices.extend(installation_data_index);
         role_indices.sort_unstable();
         if role_indices.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -3212,7 +3255,7 @@ impl StandardAgentRuntime {
             .iter()
             .enumerate()
             .filter(|(index, _)| {
-                *index != program_index
+                Some(*index) != program_index
                     && *index != schema_index
                     && *index != policy_index
                     && Some(*index) != installation_data_index
@@ -3247,7 +3290,7 @@ impl StandardAgentRuntime {
             installation_data_index.map(|index| work.availability[index].clone());
         Ok((
             invocation,
-            work.availability[program_index].bytes.as_slice(),
+            program_bytes,
             actor_schema,
             actor_policies,
             installation_data,

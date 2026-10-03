@@ -13,6 +13,10 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 experimental-state-blocks = ["vos/experimental-state-blocks"]
+# The VOS-native profile: actor programs by ProgramId through historical_lookup.
+vos-native = ["vos/runtime-program-lookup"]
+# Hash through the outer host's BLAKE2b precompile (ecalli 100).
+blake2b-precompile = ["vos/runtime-blake2b-precompile"]
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["agent-runtime"] }

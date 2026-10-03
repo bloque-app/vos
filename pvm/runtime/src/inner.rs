@@ -90,6 +90,10 @@ pub mod host_call {
     pub const PAGES: u32 = 12;
     pub const INVOKE: u32 = 13;
     pub const EXPUNGE: u32 = 14;
+    /// Gray Paper v0.8.0 Refine `historical_lookup` (call 7), served by the embedder.
+    pub const HISTORICAL_LOOKUP: u32 = 7;
+    /// The VOS BLAKE2b compression precompile, served natively to the outer program.
+    pub const BLAKE2B_COMPRESS: u32 = 100;
 }
 
 /// v0.8.0 host-call gas constants.
@@ -109,6 +113,14 @@ pub mod gas {
     pub const PAGES_INVALID: u64 = 80;
     pub const INVOKE_BASE: u64 = 968;
     pub const EXPUNGE: u64 = 335;
+    /// One BLAKE2b compression (precompile 100): a host-call boundary like PEEK's
+    /// base, plus about four times the native compression's cycles. In-guest, the same
+    /// compression costs about 4 800 gas scheduled for the 13-register PVM and
+    /// 9 700 as portable code.
+    pub const BLAKE2B_COMPRESS: u64 = 1_000;
+    /// Gray Paper v0.8.0 `historical_lookup`: M_H,c + G(M_H,l, z).
+    pub const HISTORICAL_LOOKUP_BASE: u64 = 600;
+    pub const HISTORICAL_LOOKUP_PER_KIB: u64 = 248;
 
     /// The standard memory-sized gas function, `ceil(rate * bytes / 1024)`.
     pub const fn memory(rate: u64, bytes: u64) -> u64 {

@@ -44,9 +44,15 @@ pub fn blake2b_hash<const OUT_LEN: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8
     // The infrastructure runtime deliberately has no private outer-host ABI.
     // Hashing here is ordinary deterministic guest computation so its only
     // outer host calls are standard PVM machine management (9..=14).
-    #[cfg(any(not(target_arch = "riscv64"), feature = "agent-runtime"))]
+    #[cfg(not(target_arch = "riscv64"))]
     {
         hash_via_simd::<OUT_LEN>(domain, parts)
+    }
+    // The runtime guest hashes with the protocol crate's riscv64em compression (or,
+    // where its host serves it, the precompile): the same digest as `blake2b_simd`.
+    #[cfg(all(target_arch = "riscv64", feature = "agent-runtime"))]
+    {
+        vos_protocol::blake2b::digest::<OUT_LEN>(domain, parts)
     }
 }
 
@@ -54,7 +60,7 @@ pub fn blake2b_hash<const OUT_LEN: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8
 /// Used by every non-riscv64 caller — workers, host code,
 /// wasm guests — and (transitively) by the host kernel
 /// handler for the riscv64 ECALL.
-#[cfg(any(not(target_arch = "riscv64"), feature = "agent-runtime"))]
+#[cfg(not(target_arch = "riscv64"))]
 fn hash_via_simd<const N: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8; N] {
     let mut state = blake2b_simd::Params::new().hash_length(N).to_state();
     state.update(domain);
@@ -214,6 +220,17 @@ pub(crate) fn host_compress_block(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: b
     for i in 0..8 {
         h_words[i] = u64::from_le_bytes(h[i * 8..i * 8 + 8].try_into().unwrap());
     }
+    // In the runtime guest, an actor's precompile call is served by the protocol crate's
+    // riscv64em compression rather than the portable loop below.
+    #[cfg(all(target_arch = "riscv64", feature = "agent-runtime"))]
+    {
+        unsafe { vos_protocol::blake2b::compress(&mut h_words, m.as_ptr(), t as u64, f) };
+        for i in 0..8 {
+            h[i * 8..i * 8 + 8].copy_from_slice(&h_words[i].to_le_bytes());
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
     let mut m_words = [0u64; 16];
     for i in 0..16 {
         m_words[i] = u64::from_le_bytes(m[i * 8..i * 8 + 8].try_into().unwrap());

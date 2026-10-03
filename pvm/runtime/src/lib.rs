@@ -13,6 +13,7 @@ pub mod args;
 pub mod backend;
 #[cfg(feature = "std")]
 pub mod backing;
+pub mod blake2b;
 pub mod cap;
 pub mod gas_cost;
 pub mod gas_sim;

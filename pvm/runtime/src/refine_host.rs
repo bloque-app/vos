@@ -302,6 +302,7 @@ impl RefineContext {
             value if value == u64::from(host_call::PAGES) => self.pages(),
             value if value == u64::from(host_call::INVOKE) => self.invoke(None),
             value if value == u64::from(host_call::EXPUNGE) => self.expunge(),
+            value if value == u64::from(host_call::BLAKE2B_COMPRESS) => self.blake2b_compress(),
             _ => Dispatch::Exit(ExitReason::HostCall(id)),
         }
     }
@@ -318,6 +319,7 @@ impl RefineContext {
             value if value == u64::from(host_call::PAGES) => self.pages(),
             value if value == u64::from(host_call::INVOKE) => self.invoke(Some(observer)),
             value if value == u64::from(host_call::EXPUNGE) => self.expunge(),
+            value if value == u64::from(host_call::BLAKE2B_COMPRESS) => self.blake2b_compress(),
             _ => Dispatch::Exit(ExitReason::HostCall(id)),
         }
     }
@@ -584,6 +586,36 @@ impl RefineContext {
         Dispatch::Continue
     }
 
+    /// Precompile 100: φ7 = h (64 bytes, read-write), φ8 = m (128 bytes), φ9 = the low
+    /// 64 bits of the byte counter, φ10 = the finalization flag. A memory transform:
+    /// registers are unchanged. An inaccessible range panics, as `peek` does.
+    fn blake2b_compress(&mut self) -> Dispatch {
+        let registers = *self.outer.registers();
+        if let Err(exit) = self.charge(gas::BLAKE2B_COMPRESS) {
+            return exit;
+        }
+        let (Some(h_range), Some(m)) = (
+            self.outer_range(registers[7], 64, true),
+            self.read_outer(registers[8], 128, false),
+        ) else {
+            return Dispatch::Exit(ExitReason::Panic);
+        };
+        let Some(h) = self.read_outer(registers[7], 64, true) else {
+            return Dispatch::Exit(ExitReason::Panic);
+        };
+        let mut state: [u8; 64] = h.try_into().expect("64 bytes");
+        let block: [u8; 128] = m.try_into().expect("128 bytes");
+        crate::blake2b::compress(&mut state, &block, registers[9], registers[10] != 0);
+        if !self
+            .outer
+            .memory_mut()
+            .write_bytes_checked(h_range.0, &state)
+        {
+            return Dispatch::Exit(ExitReason::Panic);
+        }
+        Dispatch::Continue
+    }
+
     fn expunge(&mut self) -> Dispatch {
         if let Err(exit) = self.charge(gas::EXPUNGE) {
             return exit;
@@ -620,6 +652,63 @@ impl RefineContext {
         };
         accessible.then_some((address, len))
     }
+}
+
+/// Serve Gray Paper v0.8.0 Refine `historical_lookup` (call 7) for an embedder whose
+/// preimage source has verified every preimage natively against its hash, as JAM's
+/// state guarantees `h = H(d)` for the preimages it holds.
+///
+/// φ7 selects the service (`2^64 - 1`, this one, is the only one served), φ8 = h (a
+/// 32-byte hash in memory), φ9 = o (output), φ10 = f (offset), φ11 = z (most bytes to
+/// write). Charges `600 + 248 per KiB of z`, then writes `v[f..f + l]` and returns
+/// `|v|` in φ7, or NONE if the preimage is unknown. An unreadable hash or unwritable
+/// output panics.
+pub fn serve_historical_lookup<'p>(
+    machine: &mut Machine,
+    preimage: impl FnOnce(&[u8; 32]) -> Option<&'p [u8]>,
+) -> Result<(), ExitReason> {
+    const NONE: u64 = u64::MAX;
+    let registers = *machine.registers();
+    let (service, h, o, f, z) = (
+        registers[7],
+        registers[8],
+        registers[9],
+        registers[10],
+        registers[11],
+    );
+    let cost =
+        gas::HISTORICAL_LOOKUP_BASE.saturating_add(gas::memory(gas::HISTORICAL_LOOKUP_PER_KIB, z));
+    if !machine.charge(cost) {
+        return Err(ExitReason::OutOfGas);
+    }
+    let mut hash = [0u8; 32];
+    let readable = u32::try_from(h)
+        .ok()
+        .is_some_and(|h| machine.memory().read_bytes_checked(h, &mut hash));
+    if !readable {
+        return Err(ExitReason::Panic);
+    }
+    let value = (service == NONE).then(|| preimage(&hash)).flatten();
+    let Some(value) = value else {
+        machine.registers_mut()[7] = NONE;
+        return Ok(());
+    };
+    let start = usize::try_from(f).unwrap_or(usize::MAX).min(value.len());
+    let length = usize::try_from(z)
+        .unwrap_or(usize::MAX)
+        .min(value.len() - start);
+    if length > 0 {
+        let writable = u32::try_from(o).ok().is_some_and(|o| {
+            machine
+                .memory_mut()
+                .write_bytes_checked(o, &value[start..start + length])
+        });
+        if !writable {
+            return Err(ExitReason::Panic);
+        }
+    }
+    machine.registers_mut()[7] = value.len() as u64;
+    Ok(())
 }
 
 fn inner_exit_reason(exit: InnerExit) -> ExitReason {

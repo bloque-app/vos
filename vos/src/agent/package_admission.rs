@@ -368,11 +368,11 @@ fn admit_actor_package_inner(
 pub fn admit_runtime_package(
     bytes: &[u8],
 ) -> Result<AdmittedRuntimePackage, PackageAdmissionError> {
-    admit_runtime_with_contract(
-        bytes,
-        vos_agent_sdk::RUNTIME_ABI_ID,
-        &vos_pvm::spi::REFINE_HOST_CALL_ALLOWLIST,
-    )
+    // Runtime profiles may also use historical_lookup (7, served by the host from
+    // natively verified preimages) and the BLAKE2b precompile (100, served by Refine).
+    let mut allowed = vos_pvm::spi::REFINE_HOST_CALL_ALLOWLIST.to_vec();
+    allowed.extend(vos_pvm::spi::REFINE_PROFILE_HOST_CALLS);
+    admit_runtime_with_contract(bytes, vos_agent_sdk::RUNTIME_ABI_ID, &allowed)
 }
 
 /// Distinct type: experimental admission cannot be passed to ordinary r19
