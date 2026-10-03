@@ -13349,51 +13349,56 @@ impl FileAgentJournalStore {
     }
 
     fn finish_deferred_startup_recovery(&mut self) -> Result<(), JournalStoreError> {
-        if !self.startup_recovery_pending {
-            return Ok(());
+        #[cfg(not(target_os = "linux"))]
+        return Err(JournalStoreError::Unavailable);
+        #[cfg(target_os = "linux")]
+        {
+            if !self.startup_recovery_pending {
+                return Ok(());
+            }
+            self.verify_lock()?;
+            discard_private_stages_at(self.directories.get("")?, is_fixed_private_stage_name)?;
+            discard_private_stages_at(
+                self.directories.get(HISTORY_DIRECTORY)?,
+                is_history_fixed_private_stage_name,
+            )?;
+            discard_private_stages_at(
+                self.directories.get(HISTORY_CANDIDATE_DIRECTORY)?,
+                is_history_candidate_private_stage_name,
+            )?;
+            for key in [
+                "records/replay-inputs",
+                "records/ordered",
+                "records/local",
+                "records/merge-events",
+                "records/merge-frontiers",
+                "records/merge-seals",
+                "checkpoints",
+                "lane-state/manifests",
+                "lane-state/blobs",
+                #[cfg(feature = "experimental-state-blocks")]
+                "lane-state/blocks",
+                "artifact-closures",
+                "invocation-index/manifests",
+                "invocation-index/nodes",
+                "invocation-outcomes",
+                "transition-proofs/records",
+                "transition-proofs/indexes",
+                "transition-proofs/blobs",
+                HEADS_HISTORY_DIRECTORY,
+                SHARED_ORDERED_COMMIT_DIRECTORY,
+                "catalog/blobs",
+                "authority/root-anchors",
+                "authority/genesis-evidence",
+                "authority/genesis-admissions",
+            ] {
+                discard_private_stages_at(self.directories.get(key)?, is_content_private_stage_name)?;
+            }
+            self.recover_history_state()?;
+            self.validate_recovery_state()?;
+            self.startup_recovery_pending = false;
+            self.verify_lock()
         }
-        self.verify_lock()?;
-        discard_private_stages_at(self.directories.get("")?, is_fixed_private_stage_name)?;
-        discard_private_stages_at(
-            self.directories.get(HISTORY_DIRECTORY)?,
-            is_history_fixed_private_stage_name,
-        )?;
-        discard_private_stages_at(
-            self.directories.get(HISTORY_CANDIDATE_DIRECTORY)?,
-            is_history_candidate_private_stage_name,
-        )?;
-        for key in [
-            "records/replay-inputs",
-            "records/ordered",
-            "records/local",
-            "records/merge-events",
-            "records/merge-frontiers",
-            "records/merge-seals",
-            "checkpoints",
-            "lane-state/manifests",
-            "lane-state/blobs",
-            #[cfg(feature = "experimental-state-blocks")]
-            "lane-state/blocks",
-            "artifact-closures",
-            "invocation-index/manifests",
-            "invocation-index/nodes",
-            "invocation-outcomes",
-            "transition-proofs/records",
-            "transition-proofs/indexes",
-            "transition-proofs/blobs",
-            HEADS_HISTORY_DIRECTORY,
-            SHARED_ORDERED_COMMIT_DIRECTORY,
-            "catalog/blobs",
-            "authority/root-anchors",
-            "authority/genesis-evidence",
-            "authority/genesis-admissions",
-        ] {
-            discard_private_stages_at(self.directories.get(key)?, is_content_private_stage_name)?;
-        }
-        self.recover_history_state()?;
-        self.validate_recovery_state()?;
-        self.startup_recovery_pending = false;
-        self.verify_lock()
     }
 
     fn open_layout(&mut self, allow_repair: bool) -> Result<(), JournalStoreError> {
@@ -14660,8 +14665,13 @@ impl FileAgentJournalStore {
         &self,
         id: R::Id,
     ) -> Result<Option<R>, JournalStoreError> {
-        self.read_object_with_work_limit(id, u64::MAX, usize::MAX)
-            .map(|(record, _, _)| record)
+        #[cfg(not(target_os = "linux"))]
+        return Err(JournalStoreError::Unavailable);
+        #[cfg(target_os = "linux")]
+        {
+            self.read_object_with_work_limit(id, u64::MAX, usize::MAX)
+                .map(|(record, _, _)| record)
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -14731,8 +14741,13 @@ impl FileAgentJournalStore {
         &self,
         id: JournalHeadsId,
     ) -> Result<Option<JournalHeads>, JournalStoreError> {
-        self.read_historical_heads_with_work_limit(id, u64::MAX, usize::MAX)
-            .map(|(heads, _, _)| heads)
+        #[cfg(not(target_os = "linux"))]
+        return Err(JournalStoreError::Unavailable);
+        #[cfg(target_os = "linux")]
+        {
+            self.read_historical_heads_with_work_limit(id, u64::MAX, usize::MAX)
+                .map(|(heads, _, _)| heads)
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -14794,8 +14809,13 @@ impl FileAgentJournalStore {
         class: JournalBlobClass,
         reference: &BlobRef,
     ) -> Result<Option<Vec<u8>>, JournalStoreError> {
-        self.read_blob_with_work_limit(class, reference, u64::MAX, usize::MAX)
-            .map(|(bytes, _, _)| bytes)
+        #[cfg(not(target_os = "linux"))]
+        return Err(JournalStoreError::Unavailable);
+        #[cfg(target_os = "linux")]
+        {
+            self.read_blob_with_work_limit(class, reference, u64::MAX, usize::MAX)
+                .map(|(bytes, _, _)| bytes)
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -14936,28 +14956,33 @@ impl FileAgentJournalStore {
         &self,
         binding: &SharedOrderedCommitBinding,
     ) -> Result<bool, JournalStoreError> {
-        self.ensure_no_gc_pending()?;
-        binding.validate()?;
-        let heads = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
-        validate_shared_ordered_commit_scope(binding, &heads, self.instance_id())?;
-        let bytes = binding.encode();
-        if let Some(existing) = self.read_shared_ordered_commit_binding(binding.entry)? {
-            return if existing == *binding {
-                Ok(false)
-            } else {
-                Err(JournalStoreError::Conflict)
-            };
+        #[cfg(not(target_os = "linux"))]
+        return Err(JournalStoreError::Unavailable);
+        #[cfg(target_os = "linux")]
+        {
+            self.ensure_no_gc_pending()?;
+            binding.validate()?;
+            let heads = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+            validate_shared_ordered_commit_scope(binding, &heads, self.instance_id())?;
+            let bytes = binding.encode();
+            if let Some(existing) = self.read_shared_ordered_commit_binding(binding.entry)? {
+                return if existing == *binding {
+                    Ok(false)
+                } else {
+                    Err(JournalStoreError::Conflict)
+                };
+            }
+            if self.audit_shared_ordered_commit_directory()? == MAX_SHARED_ORDERED_COMMIT_BINDINGS {
+                return Err(JournalStoreError::LimitExceeded);
+            }
+            persist_immutable_at(
+                self.directory(SHARED_ORDERED_COMMIT_DIRECTORY)?,
+                &encode_hex(binding.entry.as_bytes()),
+                &bytes,
+                MAX_SHARED_ORDERED_COMMIT_BINDING_BYTES,
+                |stored| decode_shared_ordered_commit_binding(stored, binding.entry).map(|_| ()),
+            )
         }
-        if self.audit_shared_ordered_commit_directory()? == MAX_SHARED_ORDERED_COMMIT_BINDINGS {
-            return Err(JournalStoreError::LimitExceeded);
-        }
-        persist_immutable_at(
-            self.directory(SHARED_ORDERED_COMMIT_DIRECTORY)?,
-            &encode_hex(binding.entry.as_bytes()),
-            &bytes,
-            MAX_SHARED_ORDERED_COMMIT_BINDING_BYTES,
-            |stored| decode_shared_ordered_commit_binding(stored, binding.entry).map(|_| ()),
-        )
     }
 
     fn read_admission(&self, name: &str) -> Result<Option<Hash>, JournalStoreError> {
@@ -16368,27 +16393,32 @@ impl SharedOrderedCommitStore for FileAgentJournalStore {
     }
 
     fn shared_ordered_commit_ids(&self) -> Result<Vec<OrderedEntryId>, JournalStoreError> {
-        let directory = self.directory(SHARED_ORDERED_COMMIT_DIRECTORY)?;
-        let names = bounded_directory_names(directory, MAX_SHARED_ORDERED_COMMIT_FILES)?;
-        let mut ids = BTreeSet::new();
-        for name in names {
-            if name.ends_with(".next") {
-                return Err(JournalStoreError::Corrupt);
+        #[cfg(not(target_os = "linux"))]
+        return Err(JournalStoreError::Unavailable);
+        #[cfg(target_os = "linux")]
+        {
+            let directory = self.directory(SHARED_ORDERED_COMMIT_DIRECTORY)?;
+            let names = bounded_directory_names(directory, MAX_SHARED_ORDERED_COMMIT_FILES)?;
+            let mut ids = BTreeSet::new();
+            for name in names {
+                if name.ends_with(".next") {
+                    return Err(JournalStoreError::Corrupt);
+                }
+                let raw = decode_hex_32(name.as_bytes()).ok_or(JournalStoreError::Corrupt)?;
+                let entry = OrderedEntryId(raw);
+                if entry == OrderedEntryId::ZERO
+                    || encode_hex(entry.as_bytes()) != name
+                    || !ids.insert(entry)
+                    || self.shared_ordered_commit(entry)?.is_none()
+                {
+                    return Err(JournalStoreError::Corrupt);
+                }
             }
-            let raw = decode_hex_32(name.as_bytes()).ok_or(JournalStoreError::Corrupt)?;
-            let entry = OrderedEntryId(raw);
-            if entry == OrderedEntryId::ZERO
-                || encode_hex(entry.as_bytes()) != name
-                || !ids.insert(entry)
-                || self.shared_ordered_commit(entry)?.is_none()
-            {
-                return Err(JournalStoreError::Corrupt);
+            if ids.len() > MAX_SHARED_ORDERED_COMMIT_BINDINGS {
+                return Err(JournalStoreError::LimitExceeded);
             }
+            Ok(ids.into_iter().collect())
         }
-        if ids.len() > MAX_SHARED_ORDERED_COMMIT_BINDINGS {
-            return Err(JournalStoreError::LimitExceeded);
-        }
-        Ok(ids.into_iter().collect())
     }
 }
 
@@ -16522,10 +16552,15 @@ impl ReverifiedRootJournalStore for FileAgentJournalStore {
     }
 
     fn sync_unexposed_generation(&self) -> Result<(), JournalStoreError> {
-        self.verify_lock()?;
-        self.directories.sync("")?;
-        self.directories.get("")?;
-        self.verify_lock()
+        #[cfg(not(target_os = "linux"))]
+        return Err(JournalStoreError::Unavailable);
+        #[cfg(target_os = "linux")]
+        {
+            self.verify_lock()?;
+            self.directories.sync("")?;
+            self.directories.get("")?;
+            self.verify_lock()
+        }
     }
 }
 

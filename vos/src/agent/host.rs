@@ -4185,7 +4185,7 @@ fn validate_agent_host_root_identity(directory: &File, root: &Path) -> Result<()
                 }
             };
             let writable = metadata.mode() & 0o022 != 0;
-            let protected_sticky = metadata.mode() & libc::S_ISVTX != 0 && trusted_owner;
+            let protected_sticky = metadata.mode() & u32::from(libc::S_ISVTX) != 0 && trusted_owner;
             if !metadata.file_type().is_dir()
                 || metadata.file_type().is_symlink()
                 || !trusted_owner
@@ -4500,7 +4500,7 @@ fn validate_agent_host_lock_parent_identity(
                 }
             };
             let writable = metadata.mode() & 0o022 != 0;
-            let protected_sticky = metadata.mode() & libc::S_ISVTX != 0 && trusted_owner;
+            let protected_sticky = metadata.mode() & u32::from(libc::S_ISVTX) != 0 && trusted_owner;
             if !metadata.file_type().is_dir()
                 || metadata.file_type().is_symlink()
                 || !trusted_owner

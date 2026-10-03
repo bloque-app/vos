@@ -1688,7 +1688,7 @@ fn require_private_directory_or_trusted_parent(path: &Path) -> Result<(), LocalA
         use std::os::unix::fs::MetadataExt as _;
         let effective_user = unsafe { libc::geteuid() };
         let trusted_owner = metadata.uid() == effective_user || metadata.uid() == 0;
-        let sticky = metadata.mode() & libc::S_ISVTX != 0;
+        let sticky = metadata.mode() & u32::from(libc::S_ISVTX) != 0;
         if !trusted_owner || metadata.mode() & 0o022 != 0 && !sticky {
             return Err(LocalAgentHostError::InvalidRoot);
         }
