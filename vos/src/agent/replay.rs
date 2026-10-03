@@ -4786,9 +4786,7 @@ impl CommittedSharedOrdered {
             || committed.term() == 0
             || committed.committed_index() < committed.index()
             || committed.payload_commitment() == Hash::ZERO
-            || trusted_committee
-                .member_by_node(reserved.local_node())
-                .is_none()
+            || !reserved.applies_locally_under(trusted_committee)
         {
             return Err(ReplayError::InvalidRecord);
         }
@@ -4835,7 +4833,7 @@ impl CommittedSharedOrdered {
             || self.raft_term == 0
             || self.raft_payload_commitment == Hash::ZERO
             || self.reservation.journal_store() != self.journal_store
-            || self.committee.member_by_node(self.local_node).is_none()
+            || !self.reservation.applies_locally_under(&self.committee)
             || self.reservation.route() != self.route
             || self.reservation.index() != self.raft_index
             || self.reservation.term() != self.raft_term

@@ -2410,6 +2410,10 @@ pub(crate) struct ReservedAgentRaftApplication {
     local_node: NodeId,
     journal_store: JournalStoreInstanceId,
     artifact_batch: Option<ArtifactBatchId>,
+    /// The ledger admitted this application for an explicit joiner that is
+    /// not yet a member of the active committee (it replays the log before
+    /// the change that names it).
+    passive_joiner: bool,
 }
 
 /// Read-only recovery evidence for an exact application already anchored
@@ -2477,6 +2481,7 @@ impl ReservedAgentRaftApplication {
             local_node,
             journal_store,
             artifact_batch,
+            passive_joiner: false,
         }
     }
 
@@ -2510,6 +2515,11 @@ impl ReservedAgentRaftApplication {
 
     pub(crate) const fn artifact_batch(&self) -> Option<ArtifactBatchId> {
         self.artifact_batch
+    }
+
+    /// The local replica applies as an explicit joiner outside `committee`.
+    pub(crate) fn applies_locally_under(&self, committee: &AgentReplicaCommittee) -> bool {
+        self.passive_joiner || committee.member_by_node(self.local_node).is_some()
     }
 }
 
@@ -3181,6 +3191,7 @@ mod evidence_ledger {
                         local_node: self.local_node,
                         journal_store: self.journal_store,
                         artifact_batch: None,
+                        passive_joiner: false,
                     });
                 }
                 let fail_stop = FailStopRecord {
@@ -3228,6 +3239,7 @@ mod evidence_ledger {
                 local_node: self.local_node,
                 journal_store: self.journal_store,
                 artifact_batch: None,
+                passive_joiner: false,
             })
         }
 
@@ -7593,6 +7605,7 @@ mod application_ledger_v2 {
                 local_node: self.local_node,
                 journal_store: self.journal_store,
                 artifact_batch: expected.artifact_batch,
+                passive_joiner: state.active.member_by_node(self.local_node).is_none(),
             })
         }
 

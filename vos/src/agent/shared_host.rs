@@ -12348,6 +12348,16 @@ mod tests {
         true
     }
 
+    /// Capture Shared journal and network warnings (for example the exact
+    /// driver error behind a `CorruptResidue`) in the failing test's output.
+    #[cfg(feature = "network")]
+    fn init_replica_test_tracing() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("vos::agent=warn,vos::network=warn")
+            .with_test_writer()
+            .try_init();
+    }
+
     /// One line per replica: host committee view, journal position, and the
     /// live Raft worker's role, term, commit and configuration.
     #[cfg(feature = "network")]
@@ -12710,6 +12720,7 @@ mod tests {
     #[cfg(all(feature = "network", feature = "pvm"))]
     #[test]
     fn signed_change_replicas_grows_one_voter_to_three_and_commits_with_two() {
+        init_replica_test_tracing();
         use crate::network::shared_agent::CleanManagementSubmission;
 
         let seeds = [0x31_u8, 0x32, 0x33];
@@ -13020,6 +13031,7 @@ mod tests {
     #[cfg(all(feature = "network", feature = "pvm"))]
     #[test]
     fn fresh_joiners_grow_and_replace_voters_under_concurrent_mutations() {
+        init_replica_test_tracing();
         use crate::network::shared_agent::CleanManagementSubmission;
         use std::sync::atomic::{AtomicBool, AtomicUsize};
 
