@@ -49,7 +49,11 @@ pub(crate) const PROTOCOL: StreamProtocol = StreamProtocol::new("/vos/agent/3.0.
 const MAGIC: [u8; 4] = *b"VAN3";
 const VERSION: u16 = 3;
 
-pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// One Agent protocol frame. It must hold one complete clean Ordered command or
+/// Merge node: a maximum-size `RuntimeWork` (4 MiB of state, the 4 608-KiB actor
+/// program and its artifacts, the caller's availability) plus its envelopes,
+/// about 9.5 MiB. 16 MiB keeps the margin the 8 MiB frame had over 7.4 MiB.
+pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Enough for one complete clean Ordered command, including its maximum-size
 /// `InvocationWork`, journal record, and generation route envelopes.
 pub(crate) const MAX_RAFT_COMMAND_BYTES: usize = MAX_RUNTIME_WORK_WIRE_BYTES + 64 * 1024;
