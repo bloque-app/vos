@@ -205,6 +205,9 @@ fn operation_for(
         ManagementRequest::ChangeReplicas { .. } => {
             (AuthorityOperationKind::ChangeReplicaSet, None, None)
         }
+        ManagementRequest::SetExecutionLimits(_) => {
+            (AuthorityOperationKind::SetExecutionLimits, None, None)
+        }
         ManagementRequest::PrivateControl { .. } => {
             panic!("private control is not a generic Local/Shared management request")
         }
