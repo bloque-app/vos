@@ -303,6 +303,13 @@ impl RefineContext {
             value if value == u64::from(host_call::INVOKE) => self.invoke(None),
             value if value == u64::from(host_call::EXPUNGE) => self.expunge(),
             value if value == u64::from(host_call::BLAKE2B_COMPRESS) => self.blake2b_compress(),
+            #[cfg(feature = "std")]
+            value
+                if (u64::from(host_call::CURVE_FIRST)..=u64::from(host_call::CURVE_LAST))
+                    .contains(&value) =>
+            {
+                self.curve(value)
+            }
             _ => Dispatch::Exit(ExitReason::HostCall(id)),
         }
     }
@@ -320,6 +327,13 @@ impl RefineContext {
             value if value == u64::from(host_call::INVOKE) => self.invoke(Some(observer)),
             value if value == u64::from(host_call::EXPUNGE) => self.expunge(),
             value if value == u64::from(host_call::BLAKE2B_COMPRESS) => self.blake2b_compress(),
+            #[cfg(feature = "std")]
+            value
+                if (u64::from(host_call::CURVE_FIRST)..=u64::from(host_call::CURVE_LAST))
+                    .contains(&value) =>
+            {
+                self.curve(value)
+            }
             _ => Dispatch::Exit(ExitReason::HostCall(id)),
         }
     }
@@ -611,6 +625,70 @@ impl RefineContext {
             .memory_mut()
             .write_bytes_checked(h_range.0, &state)
         {
+            return Dispatch::Exit(ExitReason::Panic);
+        }
+        Dispatch::Continue
+    }
+
+    /// Precompiles 110-114, natively, as memory transforms with the shims'
+    /// semantics (`vos_pvm_precompiles`): 110 `φ9 ← φ7 · φ8` (scalar, point),
+    /// 111 `φ9 ← φ7 + φ8` (points), 112 `φ8 ← wide(φ7)` (64 bytes), 113 and
+    /// 114 `φ9 ← φ7 × / + φ8 mod l`. A non-canonical scalar or an invalid
+    /// point encoding gives the all-zero sentinel. Registers are unchanged.
+    #[cfg(feature = "std")]
+    fn curve(&mut self, id: u64) -> Dispatch {
+        use curve25519_dalek::ristretto::CompressedRistretto;
+        use curve25519_dalek::scalar::Scalar;
+
+        let index = (id - u64::from(host_call::CURVE_FIRST)) as usize;
+        if let Err(exit) = self.charge(gas::CURVE[index]) {
+            return exit;
+        }
+        let registers = *self.outer.registers();
+        let read32 = |this: &Self, address: u64| -> Option<[u8; 32]> {
+            this.read_outer(address, 32, false)?.try_into().ok()
+        };
+        let scalar = |bytes: [u8; 32]| Scalar::from_canonical_bytes(bytes).into_option();
+        let point = |bytes: [u8; 32]| {
+            CompressedRistretto::from_slice(&bytes)
+                .ok()
+                .and_then(|compressed| compressed.decompress())
+        };
+        let result = match id {
+            110 => read32(self, registers[7]).zip(read32(self, registers[8])).map(|(k, p)| {
+                let out = match (scalar(k), point(p)) {
+                    (Some(k), Some(p)) => (k * p).compress().to_bytes(),
+                    _ => [0u8; 32],
+                };
+                (registers[9], out)
+            }),
+            111 => read32(self, registers[7]).zip(read32(self, registers[8])).map(|(p, q)| {
+                let out = match (point(p), point(q)) {
+                    (Some(p), Some(q)) => (p + q).compress().to_bytes(),
+                    _ => [0u8; 32],
+                };
+                (registers[9], out)
+            }),
+            112 => self.read_outer(registers[7], 64, false).map(|wide| {
+                let wide: [u8; 64] = wide.try_into().expect("64 bytes");
+                (registers[8], Scalar::from_bytes_mod_order_wide(&wide).to_bytes())
+            }),
+            _ => read32(self, registers[7]).zip(read32(self, registers[8])).map(|(a, b)| {
+                let out = match (scalar(a), scalar(b)) {
+                    (Some(a), Some(b)) if id == 113 => (a * b).to_bytes(),
+                    (Some(a), Some(b)) => (a + b).to_bytes(),
+                    _ => [0u8; 32],
+                };
+                (registers[9], out)
+            }),
+        };
+        let Some((output, bytes)) = result else {
+            return Dispatch::Exit(ExitReason::Panic);
+        };
+        let Some((address, _)) = self.outer_range(output, 32, true) else {
+            return Dispatch::Exit(ExitReason::Panic);
+        };
+        if !self.outer.memory_mut().write_bytes_checked(address, &bytes) {
             return Dispatch::Exit(ExitReason::Panic);
         }
         Dispatch::Continue

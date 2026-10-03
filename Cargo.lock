@@ -7740,6 +7740,7 @@ name = "vos-pvm"
 version = "0.1.0"
 dependencies = [
  "blake2 0.10.6",
+ "curve25519-dalek 4.1.3",
  "libc",
  "memoffset",
  "proptest",

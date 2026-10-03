@@ -41,6 +41,9 @@ agent-runtime = ["pvm", "dep:ed25519-dalek", "dep:curve25519-dalek"]
 # through the VOS precompile (ecalli 100) served natively by the outer Refine host.
 runtime-program-lookup = ["agent-runtime"]
 runtime-blake2b-precompile = ["agent-runtime", "vos-protocol/outer-blake2b-precompile"]
+# Serve actors' curve precompiles (110-114) through the outer host's native ones, at their
+# native price, rather than as runtime guest code at the interpreted price.
+runtime-native-curve = ["agent-runtime"]
 experimental-state-blocks = ["vos-agent-sdk/experimental-state-blocks"]
 # Host-only enrollment cryptography and canonical Private control verification.
 # Shared genesis uses enrollment verification; this does not enable a Private

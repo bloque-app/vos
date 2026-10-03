@@ -8,10 +8,12 @@ description = "Capability-based PVM runtime used by VOS."
 
 [features]
 default = ["std"]
-std = ["dep:libc", "dep:memoffset", "dep:blake2"]
+std = ["dep:libc", "dep:memoffset", "dep:blake2", "dep:curve25519-dalek"]
 
 [dependencies]
 blake2 = { version = "0.10", default-features = false, optional = true }
+# The constrained curve precompiles 110-114, served natively to an outer program (std hosts).
+curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables"], optional = true }
 libc = { version = "0.2", optional = true }
 memoffset = { version = "0.9", optional = true }
 scale = { package = "vos-pvm-codec", path = "../codec", default-features = false }

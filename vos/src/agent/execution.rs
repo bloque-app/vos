@@ -1315,6 +1315,10 @@ pub(crate) fn run_inner_actor_with_bounds(
                     #[cfg(feature = "agent-runtime")]
                     value if (ECALL_CURVE_FIRST..=ECALL_CURVE_LAST).contains(&value) => {
                         let price = CURVE_PRECOMPILE_GAS[(value - ECALL_CURVE_FIRST) as usize];
+                        // Served natively by the outer host, the actor pays the
+                        // native price instead of the interpreted one.
+                        #[cfg(all(feature = "runtime-native-curve", target_arch = "riscv64"))]
+                        let price = vos_pvm_native_curve_gas(value);
                         let Some(remaining) = gas.checked_sub(price) else {
                             return Ok(ActorRunOutcome::Completed {
                                 reply: terminal_reply(
@@ -1327,7 +1331,10 @@ pub(crate) fn run_inner_actor_with_bounds(
                             });
                         };
                         gas = remaining;
+                        #[cfg(not(all(feature = "runtime-native-curve", target_arch = "riscv64")))]
                         curve_precompile(&mut machine, value, &registers)?;
+                        #[cfg(all(feature = "runtime-native-curve", target_arch = "riscv64"))]
+                        curve_precompile_native(&mut machine, value, &registers)?;
                         // Like BLAKE2b, preserve the argument registers; the
                         // result is only the bytes written through the pointer.
                         (registers[7], registers[8])
@@ -1384,6 +1391,71 @@ pub(crate) fn run_inner_actor_with_bounds(
 /// host fallback and the prover's tracer. An unreadable or unwritable pointer
 /// is invalid input, as for BLAKE2b.
 #[cfg(feature = "agent-runtime")]
+/// The actor's price of a curve precompile served natively by the outer host:
+/// the outer Refine host's own price for it (`vos_pvm::inner::gas::CURVE`).
+#[cfg(all(feature = "runtime-native-curve", target_arch = "riscv64"))]
+fn vos_pvm_native_curve_gas(id: u64) -> u64 {
+    const NATIVE: [u64; 5] = [250_000, 40_000, 5_000, 5_000, 5_000];
+    NATIVE[(id - ECALL_CURVE_FIRST) as usize]
+}
+
+/// Serve an actor's curve precompile through the outer host's native one: copy
+/// the operands into the runtime's memory, issue the same call outward
+/// (`ecalli 110..=114`, the shims' register layout), and copy the 32-byte
+/// result back through the actor's output pointer. Same semantics as
+/// [`curve_precompile`].
+#[cfg(all(feature = "runtime-native-curve", target_arch = "riscv64"))]
+fn curve_precompile_native(
+    machine: &mut super::machine::ActorMachine,
+    id: u64,
+    registers: &[u64; vos_pvm_program::REGISTER_COUNT],
+) -> Result<(), ActorExecutionError> {
+    let pointer = |index: usize| {
+        u32::try_from(registers[index]).map_err(|_| ActorExecutionError::InvalidInput)
+    };
+    let mut first = [0u8; 64];
+    let mut second = [0u8; 32];
+    let mut output = [0u8; 32];
+    let (first_len, output_register) = if id == 112 { (64, 8) } else { (32, 9) };
+    machine
+        .read(pointer(7)?, &mut first[..first_len])
+        .map_err(|_| ActorExecutionError::InvalidInput)?;
+    if id != 112 {
+        machine
+            .read(pointer(8)?, &mut second)
+            .map_err(|_| ActorExecutionError::InvalidInput)?;
+    }
+    let (a0, a1, a2) = if id == 112 {
+        (first.as_ptr() as u64, output.as_mut_ptr() as u64, 0)
+    } else {
+        (
+            first.as_ptr() as u64,
+            second.as_ptr() as u64,
+            output.as_mut_ptr() as u64,
+        )
+    };
+    // SAFETY: the three buffers live across the call; the host writes only the
+    // 32 output bytes and leaves the argument registers unchanged.
+    unsafe {
+        core::arch::asm!(
+            "csrw 0x801, zero",
+            "ecall",
+            in("t0") id,
+            inlateout("a0") a0 => _,
+            inlateout("a1") a1 => _,
+            inlateout("a2") a2 => _,
+            in("a3") 0u64,
+            in("a4") 0u64,
+            in("a5") crate::abi::pvm::ecall::VOS_OBJECT_CAP,
+            options(nostack),
+        );
+    }
+    machine
+        .write(pointer(output_register)?, &output)
+        .map_err(|_| ActorExecutionError::InvalidInput)
+}
+
+#[cfg_attr(all(feature = "runtime-native-curve", target_arch = "riscv64"), allow(dead_code))]
 fn curve_precompile(
     machine: &mut super::machine::ActorMachine,
     id: u64,

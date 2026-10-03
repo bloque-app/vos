@@ -24,9 +24,9 @@ pub use vos_pvm_program::{Region as SpiRegion, StandardLayout, StandardProgram, 
 /// [`REFINE_PROFILE_HOST_CALLS`].
 pub const REFINE_HOST_CALL_ALLOWLIST: [u64; 6] = [9, 10, 11, 12, 13, 14];
 /// Calls an agent-runtime profile may add: Gray Paper `historical_lookup` (7), served by
-/// the embedder from natively verified preimages, and the VOS BLAKE2b precompile (100),
-/// served by Refine itself.
-pub const REFINE_PROFILE_HOST_CALLS: [u64; 2] = [7, 100];
+/// the embedder from natively verified preimages, and the VOS BLAKE2b (100) and curve
+/// (110-114) precompiles, served by Refine itself.
+pub const REFINE_PROFILE_HOST_CALLS: [u64; 7] = [7, 100, 110, 111, 112, 113, 114];
 
 /// Failure while inspecting a standard program's complete static host-call
 /// surface.

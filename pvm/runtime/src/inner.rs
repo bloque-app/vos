@@ -94,6 +94,11 @@ pub mod host_call {
     pub const HISTORICAL_LOOKUP: u32 = 7;
     /// The VOS BLAKE2b compression precompile, served natively to the outer program.
     pub const BLAKE2B_COMPRESS: u32 = 100;
+    /// The constrained curve precompiles (Ristretto scalar mult, point add,
+    /// wide reduction, scalar mul and add mod l), served natively to the
+    /// outer program by std hosts.
+    pub const CURVE_FIRST: u32 = 110;
+    pub const CURVE_LAST: u32 = 114;
 }
 
 /// v0.8.0 host-call gas constants.
@@ -119,6 +124,12 @@ pub mod gas {
     /// 9 700 as portable code.
     pub const BLAKE2B_COMPRESS: u64 = 1_000;
     /// Gray Paper v0.8.0 `historical_lookup`: M_H,c + G(M_H,l, z).
+    /// The curve precompiles 110-114 served natively, by operation: about
+    /// the native time of each (45 us a scalar mult with point decompress and
+    /// compress, 6.5 us a point addition, under 1 us the scalar operations, on
+    /// an M2 Pro) at the recompiler's roughly 4-5 G gas a second, rounded up.
+    /// In-guest they cost 3.9 M, 449 k, 12 k, 26 k and 23 k gas.
+    pub const CURVE: [u64; 5] = [250_000, 40_000, 5_000, 5_000, 5_000];
     pub const HISTORICAL_LOOKUP_BASE: u64 = 600;
     pub const HISTORICAL_LOOKUP_PER_KIB: u64 = 248;
 
