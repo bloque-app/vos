@@ -1196,6 +1196,147 @@ fn bundled_runtime_persists_and_resumes_fifo_continuations() {
 /// This regression consumes a freshly compiled `agent-runtime` PVM rather
 /// than the checked-in pin. Keeping it ignored makes the source/guest ABI
 /// check explicit without silently blessing or rewriting the release pin.
+/// Both backends, prepared once per test thread, run the exact same
+/// AgentRuntime work at `gas` and must agree on every observable: load
+/// refusal, exit, counter, registers, gas to the unit and output bytes.
+/// Independent of `VOS_AGENT_COMPARE_BACKENDS`, which only instruments
+/// `apply_runtime_program`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn assert_backends_agree(runtime_pvm: &[u8], input: &[u8], gas: u64) {
+    use vos_pvm::PvmBackend;
+    type Prepared = (Vec<u8>, PreparedProgram, PreparedProgram);
+    thread_local! {
+        static PAIR: std::cell::RefCell<Option<Prepared>> = const { std::cell::RefCell::new(None) };
+    }
+    PAIR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot
+            .as_ref()
+            .is_none_or(|(bytes, _, _)| bytes != runtime_pvm)
+        {
+            *slot = Some((
+                runtime_pvm.to_vec(),
+                PreparedProgram::new_with_backend(runtime_pvm, PvmBackend::ForceInterpreter)
+                    .unwrap(),
+                PreparedProgram::new_with_backend(runtime_pvm, PvmBackend::ForceRecompiler)
+                    .unwrap(),
+            ));
+        }
+        let (_, reference, native) = slot.as_ref().unwrap();
+        let run = |prepared: &PreparedProgram| {
+            RefineContext::load_prepared(prepared, input, gas, MemoryModel::Auto)
+                .and_then(RefineContext::try_run)
+                .map(|invocation| {
+                    (
+                        invocation.exit.clone(),
+                        invocation.pc,
+                        invocation.gas_used,
+                        invocation.registers,
+                        invocation.output_bounded(RuntimeTransition::MAX_ENCODED_BYTES),
+                    )
+                })
+        };
+        assert_eq!(
+            run(native),
+            run(reference),
+            "the backends diverge on the AgentRuntime at gas {gas}"
+        );
+    });
+}
+
+fn faulting_actor_program() -> Vec<u8> {
+    // Load from 256 MiB, far above any region of a standard actor image.
+    let mut actor = Assembler::new();
+    actor
+        .load_imm_64(Reg::A2, 0x1000_0000)
+        .load_ind_u64(Reg::A0, Reg::A2, 0)
+        .jump_ind(Reg::RA, 0);
+    actor.build_standard()
+}
+
+fn spinning_actor_program() -> Vec<u8> {
+    // A one-instruction block that jumps to itself until the actor's gas is
+    // spent: out-of-gas at a block boundary, inside an inner machine.
+    let mut actor = Assembler::new();
+    actor.jump(0);
+    actor.build_standard()
+}
+
+fn invoke_once(
+    program: Vec<u8>,
+    discriminator: u8,
+    gas: Option<u64>,
+) -> (RuntimeWork, RuntimeTransition) {
+    let (runtime, descriptor, created) = create_agent(discriminator);
+    let actor_package = admitted_actor_program(program);
+    let (installed, _, _) = install_actor(&runtime, &descriptor, created, &actor_package);
+    let record = inspect_actor(&descriptor, installed.clone());
+    let mut work = actor_invocation(&descriptor, &record, &actor_package, discriminator);
+    if let Some(gas) = gas {
+        work.gas = gas;
+    }
+    let authority = invocation_receipt(&descriptor, &work, 3, 3);
+    let work = RuntimeWork::Invoke {
+        context: RuntimeExecutionContext::Direct,
+        state: installed,
+        invocation: Box::new(work),
+        authorization: Box::new(InvocationAuthorization::AuthorityReceipt(authority)),
+        observed_slot: 3,
+    };
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    assert_backends_agree(AGENT_RUNTIME_PVM, &work.encode().unwrap(), GAS);
+    let transition = apply_runtime(work.clone());
+    (work, transition)
+}
+
+/// Actor page faults and actor out-of-gas cross the inner-machine boundary
+/// as exits the runtime must handle; on Linux x86-64 both backends must
+/// report them identically.
+#[test]
+fn faulting_and_spinning_actors_fail_identically_on_both_backends() {
+    fn failed(transition: &RuntimeTransition) -> bool {
+        match &transition.outcome {
+            RuntimeOutcome::Completed(Ok(reply)) => reply.status != InvocationStatus::Done,
+            _ => true,
+        }
+    }
+    let (_, faulted) = invoke_once(faulting_actor_program(), 0x51, None);
+    assert!(
+        failed(&faulted),
+        "a faulting actor cannot complete: {:?}",
+        faulted.outcome
+    );
+    for gas in [1, 2, 3, 1_000, 10_000, 100_000] {
+        let (_, spun) = invoke_once(spinning_actor_program(), 0x52, Some(gas));
+        assert!(
+            failed(&spun),
+            "a spinning actor cannot complete: {:?}",
+            spun.outcome
+        );
+    }
+}
+
+/// The whole Agent path at many gas budgets: one yielding invocation, with
+/// the runtime's budget cut at 65 evenly spaced points and at every unit
+/// around the total, so out-of-gas lands in the runtime's own blocks, in the
+/// machine calls and inside the actor.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn agent_executions_match_across_backends_at_sampled_gas_budgets() {
+    let (work, _) = invoke_once(yielding_actor_program(), 0x53, None);
+    let input = work.encode().unwrap();
+    let used = RefineContext::load(AGENT_RUNTIME_PVM, &input, GAS)
+        .unwrap()
+        .run()
+        .gas_used;
+    let mut budgets: std::collections::BTreeSet<u64> = (0..=64).map(|i| used * i / 64).collect();
+    budgets.extend(used.saturating_sub(8)..=used + 2);
+    for gas in &budgets {
+        assert_backends_agree(AGENT_RUNTIME_PVM, &input, *gas);
+    }
+    eprintln!("{} budgets up to {used} gas matched", budgets.len());
+}
+
 #[test]
 #[ignore = "set VOS_AGENT_RUNTIME_PVM to a freshly compiled bundled guest PVM"]
 fn compiled_runtime_directory_reports_exact_install_lineage_after_restart() {
