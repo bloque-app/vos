@@ -12818,22 +12818,27 @@ mod tests {
             fixture.descriptor.creation_nonce,
             &grown,
         );
-        assert!(matches!(
-            manage_live(
-                &mut attachments,
-                agent,
-                &change,
-                &change_receipt,
-                SdkManagementArtifacts::None,
+        // Under load a committed attempt may lose its reply wait; the exact
+        // retry then returns the retained result instead of a new slot.
+        let changed = manage_live(
+            &mut attachments,
+            agent,
+            &change,
+            &change_receipt,
+            SdkManagementArtifacts::None,
+        );
+        assert!(
+            matches!(
+                &changed,
+                CleanManagementSubmission::Applied {
+                    outcome: crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                        crate::agent_sdk::ManagementReply::ReplicasChanged { generation }
+                    )),
+                    ..
+                } if *generation == expected_generation
             ),
-            CleanManagementSubmission::Applied {
-                outcome: crate::agent_sdk::RuntimeOutcome::Management(Ok(
-                    crate::agent_sdk::ManagementReply::ReplicasChanged { generation }
-                )),
-                new_slot: true,
-                ..
-            } if generation == expected_generation
-        ));
+            "replica change did not apply: {changed:?}"
+        );
         let all = hosts.iter().collect::<Vec<_>>();
         let converged = wait_until(std::time::Duration::from_secs(30), || {
             attachments.iter_mut().flatten().for_each(|attachment| {
@@ -12906,22 +12911,25 @@ mod tests {
         slot.store(22, Ordering::SeqCst);
         let suspend_receipt =
             clean_management_receipt(&fixture.descriptor, &suspend, 4, &fixture.authority_key);
-        assert!(matches!(
-            manage_live(
-                &mut attachments,
-                agent,
-                &suspend,
-                &suspend_receipt,
-                SdkManagementArtifacts::None,
+        let suspended = manage_live(
+            &mut attachments,
+            agent,
+            &suspend,
+            &suspend_receipt,
+            SdkManagementArtifacts::None,
+        );
+        assert!(
+            matches!(
+                &suspended,
+                CleanManagementSubmission::Applied {
+                    outcome: crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                        crate::agent_sdk::ManagementReply::Suspended(_)
+                    )),
+                    ..
+                }
             ),
-            CleanManagementSubmission::Applied {
-                outcome: crate::agent_sdk::RuntimeOutcome::Management(Ok(
-                    crate::agent_sdk::ManagementReply::Suspended(_)
-                )),
-                new_slot: true,
-                ..
-            }
-        ));
+            "two-of-three Suspend did not apply: {suspended:?}"
+        );
         let survivors = hosts.iter().collect::<Vec<_>>();
         let converged = wait_until(std::time::Duration::from_secs(30), || {
             committee_converged(&survivors, agent, &grown)

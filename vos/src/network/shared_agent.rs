@@ -802,9 +802,10 @@ impl AttachmentFingerprint {
         if self.next_committee.is_some() != self.next_voters.is_some() {
             return false;
         }
+        // A joiner replays history: it may observe earlier transitions that
+        // never name it. It stays a passive observer outside every set.
         if self.joining {
             return self.local_role == ReplicaRole::Observer
-                && self.next_committee.is_none()
                 && !self.members.iter().any(|(node, _)| *node == local);
         }
         let member = self
@@ -1254,6 +1255,7 @@ pub(crate) struct CleanOrderedSubmission {
 /// Result of clean management admission through the live Raft worker.
 /// Guest denial is explicitly nondurable; every successful unseen request is
 /// applied from a real committed Ordered slot.
+#[derive(Debug)]
 pub(crate) enum CleanManagementSubmission {
     Denied {
         outcome: RuntimeOutcome,
