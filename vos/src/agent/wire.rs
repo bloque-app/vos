@@ -19,6 +19,11 @@ use super::{
     RuntimeRequirements, StateLane,
 };
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
+
+/// The composite engine (`runtime-composite`): steps over the Agent's own
+/// actors in their primary's one Linear transition (`super::composite`).
+#[cfg(all(feature = "pvm", feature = "runtime-composite"))]
+pub mod composite_engine;
 use crate::service::{
     ActorId, AgentId, BlobRef, CapabilityId, DeploymentId, Hash, NodeId, PrincipalId, ProducerId,
     ProgramId, SpaceId,
@@ -464,6 +469,44 @@ const STANDARD_CLEAN_INVOCATION_ERRORS_MAGIC: [u8; 4] = *b"SCER";
 const STANDARD_SEQUENCED_RETIREMENT_MAGIC: [u8; 4] = *b"SQRT";
 const STANDARD_PROGRAM_BINDINGS_MAGIC: [u8; 4] = *b"SPB1";
 const STANDARD_EXECUTION_LIMITS_MAGIC: [u8; 4] = *b"SXL1";
+const STANDARD_STREAM_HEADS_MAGIC: [u8; 4] = *b"SST1";
+
+/// Optional last section of the control component, after the execution
+/// limits: the applied heads of numbered message streams
+/// (`runtime-composite`). Absent while empty, so every other image encodes
+/// exactly as before.
+fn encode_stream_heads_section(encoder: &mut Encoder<'_>, state: &StandardRuntimeState) {
+    if state.stream_heads.is_empty() {
+        return;
+    }
+    encoder.0.extend_from_slice(&STANDARD_STREAM_HEADS_MAGIC);
+    encoder.u16(1);
+    encoder.list(&state.stream_heads, |encoder, head| {
+        encoder.fixed(&head.stream);
+        encoder.u64(head.sequence);
+    });
+}
+
+fn decode_stream_heads_section(
+    decoder: &mut Decoder<'_>,
+) -> Result<Vec<super::standard::StandardStreamHead>, DecodeError> {
+    if decoder.exhausted() {
+        return Ok(Vec::new());
+    }
+    if decoder.take(4)? != STANDARD_STREAM_HEADS_MAGIC || decoder.u16()? != 1 {
+        return Err(DecodeError::NonCanonical);
+    }
+    let heads = decode_bounded_list(decoder, super::standard::MAX_STREAM_HEADS, |decoder| {
+        Ok(super::standard::StandardStreamHead {
+            stream: decoder.fixed()?,
+            sequence: decoder.u64()?,
+        })
+    })?;
+    if heads.is_empty() {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(heads)
+}
 
 /// Optional last section of the control component, after the program
 /// bindings: the Agent's non-standard execution bounds.
@@ -483,7 +526,9 @@ fn encode_execution_limits_section(encoder: &mut Encoder<'_>, state: &StandardRu
 fn decode_execution_limits_section(
     decoder: &mut Decoder<'_>,
 ) -> Result<Option<crate::agent_sdk::contract::ExecutionLimits>, DecodeError> {
-    if decoder.exhausted() {
+    if decoder.exhausted()
+        || decoder.peek(STANDARD_STREAM_HEADS_MAGIC.len()) == Some(&STANDARD_STREAM_HEADS_MAGIC[..])
+    {
         return Ok(None);
     }
     if decoder.take(4)? != STANDARD_EXECUTION_LIMITS_MAGIC || decoder.u16()? != 1 {
@@ -524,6 +569,7 @@ fn decode_program_bindings(
     if decoder.exhausted()
         || decoder.peek(STANDARD_EXECUTION_LIMITS_MAGIC.len())
             == Some(&STANDARD_EXECUTION_LIMITS_MAGIC[..])
+        || decoder.peek(STANDARD_STREAM_HEADS_MAGIC.len()) == Some(&STANDARD_STREAM_HEADS_MAGIC[..])
     {
         return Ok(Vec::new());
     }
@@ -919,6 +965,7 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
     encode_sequenced_retirement(&mut encoder, state, super::InvocationResultStorage::Control);
     encode_program_bindings(&mut encoder, state);
     encode_execution_limits_section(&mut encoder, state);
+    encode_stream_heads_section(&mut encoder, state);
     RuntimeState {
         control,
         linear: encode_standard_lane(state, StateLane::Linear),
@@ -1391,6 +1438,7 @@ fn decode_standard_runtime_components(
         decode_result_component_tail(&mut decoder, super::InvocationResultStorage::Control)?;
     let program_bindings = decode_program_bindings(&mut decoder)?;
     let execution_limits = decode_execution_limits_section(&mut decoder)?;
+    let stream_heads = decode_stream_heads_section(&mut decoder)?;
     if !decoder.exhausted() {
         return Err(DecodeError::TrailingBytes);
     }
@@ -1489,6 +1537,7 @@ fn decode_standard_runtime_components(
         authority_dispositions,
         program_bindings,
         execution_limits,
+        stream_heads,
     };
     Ok(state)
 }
@@ -3834,6 +3883,20 @@ fn apply_clean_invoke_restored(
                         },
                         Ok(Some(_)) => unreachable!("exact recovery returned above"),
                     };
+                    #[cfg(feature = "runtime-composite")]
+                    composite_engine::apply_tail(
+                        &mut runtime,
+                        &work,
+                        &authorization,
+                        &admission,
+                        invocation,
+                        actor_pvm,
+                        resolved.work_validated(),
+                        observed_slot,
+                        execution_limits,
+                        storage_backend,
+                        &mut result,
+                    );
                     let committed = finalize_unseen_clean_outcome(
                         &mut runtime,
                         pristine,

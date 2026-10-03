@@ -19,6 +19,9 @@ vos-native = ["vos/runtime-program-lookup"]
 blake2b-precompile = ["vos/runtime-blake2b-precompile"]
 # Actors' curve precompiles served natively by the outer host.
 native-curve = ["vos/runtime-native-curve"]
+# Composite invocations: steps over the Agent's own actors in one Linear transition.
+# Not the standard runtime: a separate program, for Agents that pin it.
+composite = ["vos/runtime-composite"]
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["agent-runtime"] }

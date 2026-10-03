@@ -44,6 +44,10 @@ runtime-blake2b-precompile = ["agent-runtime", "vos-protocol/outer-blake2b-preco
 # Serve actors' curve precompiles (110-114) through the outer host's native ones, at their
 # native price, rather than as runtime guest code at the interpreted price.
 runtime-native-curve = ["agent-runtime"]
+# Composite invocations: one Linear transition across several of an Agent's own actors,
+# with ordered and exactly-once numbered steps (`agent::composite`). A runtime that
+# enables it is its own program; the standard runtime does not.
+runtime-composite = ["pvm"]
 experimental-state-blocks = ["vos-agent-sdk/experimental-state-blocks"]
 # Host-only enrollment cryptography and canonical Private control verification.
 # Shared genesis uses enrollment verification; this does not enable a Private

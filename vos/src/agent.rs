@@ -25,6 +25,7 @@ pub mod authority_operation_coordinator;
 pub mod authority_operation_issuer;
 pub mod bootstrap;
 pub mod catalog_finality;
+pub mod composite;
 #[cfg(feature = "std")]
 pub mod clean_authority_issuer;
 #[cfg(feature = "std")]

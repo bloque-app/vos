@@ -183,7 +183,7 @@ fn installation_data_aliases_actor_artifact(
 /// serve_historical_lookup`). The allocation is leaked: it lives as long as this one
 /// execution's guest.
 #[cfg(all(feature = "runtime-program-lookup", target_arch = "riscv64"))]
-fn lookup_program(
+pub(crate) fn lookup_program(
     program: &crate::agent_sdk::ProgramId,
 ) -> Result<&'static [u8], crate::agent_sdk::InvocationError> {
     use crate::agent_sdk::InvocationError;
@@ -258,6 +258,10 @@ pub struct StandardAgentRuntime {
     /// The Agent's per-invocation execution bounds; `None` is
     /// `ExecutionLimits::STANDARD`.
     execution_limits: Option<crate::agent_sdk::contract::ExecutionLimits>,
+    /// Last applied sequence of every numbered message stream a composite
+    /// invocation has applied (`runtime-composite`). Empty, and absent from
+    /// the image, in every Agent that never used one.
+    stream_heads: BTreeMap<[u8; 32], u64>,
     /// Installation identities remain consumed after their actor leaves the
     /// live directory, preventing an install replay from becoming a new
     /// incarnation after `RemoveLeaf`.
@@ -334,7 +338,22 @@ pub struct StandardRuntimeState {
     /// Non-standard execution bounds; absent in every image that never set
     /// them, which then encodes exactly as it did before they existed.
     pub execution_limits: Option<crate::agent_sdk::contract::ExecutionLimits>,
+    /// Applied heads of numbered message streams, ordered by stream; absent
+    /// in every image that never applied one (`runtime-composite`).
+    pub stream_heads: Vec<StandardStreamHead>,
 }
+
+/// The last sequence applied from one numbered message stream. A composite
+/// invocation applies a stream's message only at `sequence + 1`: a repeat is a
+/// no-op and a gap waits, so each message applies exactly once, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StandardStreamHead {
+    pub stream: [u8; 32],
+    pub sequence: u64,
+}
+
+/// Most numbered message streams one Agent tracks.
+pub const MAX_STREAM_HEADS: usize = 4096;
 
 /// The availability reference of one actor's program, bound to its ProgramId
 /// by this runtime: on the first invocation that resolved the program, the
@@ -854,7 +873,7 @@ fn clean_blob_to_legacy(reference: &crate::agent_sdk::BlobRef) -> crate::service
     }
 }
 
-fn clean_reference_matches_record(
+pub(crate) fn clean_reference_matches_record(
     reference: &crate::agent_sdk::BlobRef,
     expected: &crate::service::BlobRef,
 ) -> bool {
@@ -1368,6 +1387,7 @@ impl StandardAgentRuntime {
             actors: BTreeMap::new(),
             program_bindings: BTreeMap::new(),
             execution_limits: None,
+            stream_heads: BTreeMap::new(),
             retired_installation_ids: BTreeSet::new(),
             lane_state: StandardLaneState {
                 linear: Vec::new(),
@@ -1506,6 +1526,14 @@ impl StandardAgentRuntime {
             authority_dispositions: self.authority_dispositions.clone(),
             program_bindings: self.program_bindings.values().cloned().collect(),
             execution_limits: self.execution_limits,
+            stream_heads: self
+                .stream_heads
+                .iter()
+                .map(|(stream, sequence)| StandardStreamHead {
+                    stream: *stream,
+                    sequence: *sequence,
+                })
+                .collect(),
         }
     }
 
@@ -2043,6 +2071,20 @@ impl StandardAgentRuntime {
             return Err(LifecycleError::InvalidRequest);
         }
         runtime.execution_limits = state.execution_limits;
+        if state.stream_heads.len() > MAX_STREAM_HEADS
+            || state
+                .stream_heads
+                .windows(2)
+                .any(|pair| pair[0].stream >= pair[1].stream)
+            || state.stream_heads.iter().any(|head| head.sequence == 0)
+        {
+            return Err(LifecycleError::InvalidRequest);
+        }
+        runtime.stream_heads = state
+            .stream_heads
+            .iter()
+            .map(|head| (head.stream, head.sequence))
+            .collect();
         for (actor, expected_deployment) in suspended {
             runtime.set_suspended(actor, expected_deployment, true)?;
         }
@@ -7531,6 +7573,174 @@ fn derive_state_generation(claim: Hash, sequence: u64, operation: Hash, actor: A
     // bits except this dedicated marker bit.
     generation.0[0] |= 0x80;
     generation
+}
+
+/// What a composite invocation needs of one installed actor
+/// (`runtime-composite`): its identity, artifacts and lanes, read from the
+/// directory, never from the caller.
+#[cfg(all(feature = "pvm", feature = "runtime-composite"))]
+#[derive(Clone, Debug)]
+pub(crate) struct CompositeActorView {
+    pub(crate) actor: ActorId,
+    pub(crate) incarnation: Hash,
+    pub(crate) deployment: DeploymentId,
+    pub(crate) program: ProgramId,
+    pub(crate) agent_schema: crate::service::BlobRef,
+    pub(crate) role_policies: crate::service::BlobRef,
+    pub(crate) installation_data: Option<crate::service::BlobRef>,
+    pub(crate) suspended: bool,
+    pub(crate) linear: bool,
+    pub(crate) bound_program: Option<crate::agent_sdk::BlobRef>,
+}
+
+#[cfg(all(feature = "pvm", feature = "runtime-composite"))]
+impl StandardAgentRuntime {
+    /// The directory's view of `actor`, if installed.
+    pub(crate) fn composite_actor(&self, actor: ActorId) -> Option<CompositeActorView> {
+        let managed = self.actors.get(&actor)?;
+        let record = &managed.record;
+        Some(CompositeActorView {
+            actor,
+            incarnation: record.state_generation,
+            deployment: record.entry.deployment,
+            program: record.entry.program,
+            agent_schema: record.agent_schema.clone(),
+            role_policies: record.role_policies.clone(),
+            installation_data: record.installation_data.clone(),
+            suspended: record.entry.suspended,
+            linear: record.entry.lanes.contains(StateLane::Linear),
+            bound_program: self.bound_program_reference(actor).cloned(),
+        })
+    }
+
+    /// The last sequence applied from `stream` (0: none yet).
+    pub(crate) fn stream_head(&self, stream: &[u8; 32]) -> u64 {
+        self.stream_heads.get(stream).copied().unwrap_or(0)
+    }
+
+    /// Record that `stream`'s message `sequence` applied. Only its successor
+    /// may follow; the head never moves back.
+    pub(crate) fn advance_stream(
+        &mut self,
+        stream: [u8; 32],
+        sequence: u64,
+    ) -> Result<(), super::execution::ActorExecutionError> {
+        use super::execution::ActorExecutionError;
+        let head = self.stream_head(&stream);
+        if head.checked_add(1) != Some(sequence) {
+            return Err(ActorExecutionError::InvalidInput);
+        }
+        if head == 0 && self.stream_heads.len() >= MAX_STREAM_HEADS {
+            return Err(ActorExecutionError::ResultCapacity);
+        }
+        self.stream_heads.insert(stream, sequence);
+        Ok(())
+    }
+
+    /// Commit one composite step's lanes: the lane checks of
+    /// [`Self::commit_execution`], without retaining a result. A step's
+    /// invocation identity is derived from its composite's and is never
+    /// retained or acknowledged on its own: the composite's one result covers
+    /// every step.
+    pub(crate) fn commit_composite_step(
+        &mut self,
+        invocation: &super::execution::ActorInvocation,
+        reply: &super::execution::ActorExecutionReply,
+        before: &super::execution::ActorStateLanes,
+        mut after: super::execution::ActorStateLanes,
+    ) -> Result<(), super::execution::ActorExecutionError> {
+        use super::execution::ActorExecutionError;
+        self.validate_invocation_target(invocation)?;
+        if reply.invocation != invocation.invocation
+            || reply.actor != invocation.actor
+            || reply.incarnation != invocation.incarnation
+            || reply.deployment != invocation.deployment
+            || reply.mode != invocation.mode
+            || reply.lane != invocation.mode.write_lane()
+            || invocation.mode != super::MethodMode::Linear
+        {
+            return Err(ActorExecutionError::InvalidActorOutput);
+        }
+        let write_lane = invocation.mode.write_lane();
+        for lane in [StateLane::Linear, StateLane::Merge, StateLane::Local] {
+            let previous = before.get(lane);
+            if Some(lane) != write_lane && !invocation.mode.can_read(lane) {
+                if after.get(lane).is_some_and(|bytes| !bytes.is_empty()) {
+                    return Err(ActorExecutionError::InvalidActorOutput);
+                }
+            } else if Some(lane) != write_lane {
+                match previous {
+                    Some(previous) if after.get(lane) != Some(previous) => {
+                        return Err(ActorExecutionError::InvalidActorOutput);
+                    }
+                    None if after.get(lane).is_some_and(|bytes| !bytes.is_empty()) => {
+                        return Err(ActorExecutionError::InvalidActorOutput);
+                    }
+                    Some(_) | None => {}
+                }
+            }
+        }
+        let lane = write_lane.ok_or(ActorExecutionError::InvalidActorOutput)?;
+        let state = after
+            .take(lane)
+            .ok_or(ActorExecutionError::InvalidActorOutput)?;
+        if state.len() > self.execution_limits().max_lane_state_bytes as usize {
+            return Err(ActorExecutionError::InvalidActorOutput);
+        }
+        let actor = self
+            .actors
+            .get(&reply.actor)
+            .ok_or(ActorExecutionError::NotFound)?;
+        if actor.record.state_generation != reply.incarnation {
+            return Err(ActorExecutionError::StaleIncarnation);
+        }
+        self.lane_state.upsert(
+            lane,
+            actor.record.entry.actor,
+            actor.record.state_generation,
+            state,
+        )?;
+        self.lane_revisions.increment(lane)?;
+        Ok(())
+    }
+
+    /// Replace the reply retained for `invocation` (a composite's primary,
+    /// committed by [`Self::commit_execution`] in this same candidate) with the
+    /// composite's reply, within the same result bounds.
+    pub(crate) fn replace_retained_reply(
+        &mut self,
+        invocation: &super::execution::ActorInvocation,
+        reply: &mut super::execution::ActorExecutionReply,
+    ) -> Result<(), super::execution::ActorExecutionError> {
+        use super::execution::ActorExecutionError;
+        if reply.reply.len() > super::execution::MAX_EXECUTION_REPLY_BYTES {
+            return Err(ActorExecutionError::ResultCapacity);
+        }
+        reply.observation = self.observation(reply.actor, reply.mode)?;
+        let scope = invocation.mode.invocation_scope();
+        let storage = invocation.mode.result_storage();
+        let previous = self
+            .invocation_results
+            .get(&(scope, invocation.invocation))
+            .ok_or(ActorExecutionError::InvalidActorOutput)?
+            .reply
+            .reply
+            .len();
+        if self
+            .invocation_result_bytes(storage)
+            .saturating_sub(previous)
+            .saturating_add(reply.reply.len())
+            > MAX_INVOCATION_RESULT_BYTES_PER_LANE
+        {
+            return Err(ActorExecutionError::ResultCapacity);
+        }
+        let retained = self
+            .invocation_results
+            .get_mut(&(scope, invocation.invocation))
+            .ok_or(ActorExecutionError::InvalidActorOutput)?;
+        retained.reply = reply.clone();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
