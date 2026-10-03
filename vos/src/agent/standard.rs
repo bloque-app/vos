@@ -2995,8 +2995,11 @@ impl StandardAgentRuntime {
         let mut policy_index = None;
         let mut installation_data_index = None;
         for (index, blob) in work.availability.iter().enumerate() {
+            // NEVER MERGE: measurement-only stub (exp/single-pass-hash-stub). A
+            // blob above 64 KiB is taken as the program without computing its
+            // ProgramId: the runtime trusts the host for the program's identity.
             if blob.bytes.len() <= super::execution::MAX_EXECUTION_PROGRAM_BYTES
-                && crate::agent_sdk::ProgramId::of_pvm(&blob.bytes) == work.program
+                && blob.bytes.len() > crate::agent_sdk::UNSAFE_STUB_UNHASHED_BLOB_BYTES
             {
                 if program_index.replace(index).is_some() {
                     return Err(InvocationError::InvalidAvailability);

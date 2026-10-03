@@ -94,8 +94,19 @@ pub struct RuntimeBlob {
     pub bytes: Vec<u8>,
 }
 
+/// NEVER MERGE: see [`RuntimeBlob::validate`].
+pub const UNSAFE_STUB_UNHASHED_BLOB_BYTES: usize = 64 * 1024;
+
 impl RuntimeBlob {
     pub fn validate(&self) -> bool {
+        // NEVER MERGE: measurement-only stub (exp/single-pass-hash-stub). Blobs
+        // above 64 KiB are checked by length only, so the runtime trusts the host
+        // for their content. This is unsafe and exists to bound the gain of a
+        // single hashing pass.
+        if self.bytes.len() > UNSAFE_STUB_UNHASHED_BLOB_BYTES {
+            return self.bytes.len() <= MAX_RUNTIME_AVAILABILITY_BYTES
+                && self.reference.len == self.bytes.len() as u64;
+        }
         self.bytes.len() <= MAX_RUNTIME_AVAILABILITY_BYTES && self.reference.matches(&self.bytes)
     }
 }
