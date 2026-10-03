@@ -12971,17 +12971,22 @@ mod tests {
     }
 
     /// Receipt valid over a wide logical window, for long concurrent runs in
-    /// which every attempt observes a strictly later slot.
+    /// which every attempt observes a strictly later slot. Like a production
+    /// issuer it acknowledges every decision whose terminal it has observed,
+    /// so the runtime retires those dispositions instead of filling its
+    /// bounded unacknowledged journal (`MAX_AUTHORITY_DISPOSITIONS`).
     #[cfg(feature = "pvm")]
     fn wide_management_receipt(
         descriptor: &crate::agent_sdk::AgentDescriptor,
         request: &crate::agent_sdk::ManagementRequest,
         sequence: u64,
         epoch: u64,
+        acknowledged_through: u64,
         authority_key: &SigningKey,
     ) -> crate::agent_sdk::authority::AuthorityReceipt {
         let mut receipt = clean_management_receipt(descriptor, request, sequence, authority_key);
         receipt.selector.epoch = epoch;
+        receipt.selector.acknowledged_through = acknowledged_through;
         receipt.selector.expires_at = 1_000_000;
         receipt.signature = authority_key.sign(&receipt.signing_bytes()).to_bytes();
         receipt.validate_shape().unwrap();
@@ -13050,6 +13055,8 @@ mod tests {
         let slot = Arc::new(AtomicU64::new(20));
         let sequence = Arc::new(AtomicU64::new(1));
         let epoch = Arc::new(AtomicU64::new(1));
+        // Highest decision sequence whose applied terminal the test observed.
+        let acknowledged_through = Arc::new(AtomicU64::new(0));
         let next_receipt = |request: &crate::agent_sdk::ManagementRequest, epoch: u64| {
             slot.fetch_add(1, Ordering::SeqCst);
             wide_management_receipt(
@@ -13057,6 +13064,7 @@ mod tests {
                 request,
                 sequence.fetch_add(1, Ordering::SeqCst) + 1,
                 epoch,
+                acknowledged_through.load(Ordering::SeqCst),
                 &fixture.authority_key,
             )
         };
@@ -13174,6 +13182,8 @@ mod tests {
                     ..
                 }) = result
                 {
+                    acknowledged_through
+                        .fetch_max(install_receipt.selector.decision_sequence, Ordering::SeqCst);
                     break entry;
                 }
                 assert!(
@@ -13198,6 +13208,7 @@ mod tests {
             let slot = Arc::clone(&slot);
             let sequence = Arc::clone(&sequence);
             let epoch = Arc::clone(&epoch);
+            let acknowledged_through = Arc::clone(&acknowledged_through);
             let descriptor = fixture.descriptor.clone();
             let authority_key = fixture.authority_key.clone();
             std::thread::spawn(move || {
@@ -13225,6 +13236,7 @@ mod tests {
                             &request,
                             sequence.fetch_add(1, Ordering::SeqCst) + 1,
                             epoch.load(Ordering::SeqCst),
+                            acknowledged_through.load(Ordering::SeqCst),
                             &authority_key,
                         );
                         (request, receipt)
@@ -13236,6 +13248,8 @@ mod tests {
                             ..
                         }) => {
                             suspended = !suspended;
+                            acknowledged_through
+                                .fetch_max(receipt.selector.decision_sequence, Ordering::SeqCst);
                             let acknowledged_phase = phase.load(Ordering::Acquire);
                             acknowledged.push((acknowledged_phase, request, receipt, outcome));
                             last_ack.store(acknowledged_phase + 1, Ordering::Release);
@@ -13249,7 +13263,8 @@ mod tests {
                         // idempotent if it did commit.
                         Err(_) => pending = Some((request, receipt)),
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    // Throttled, but still continuous across every transition.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 (acknowledged, suspended)
             })
@@ -13277,7 +13292,11 @@ mod tests {
                                 crate::agent_sdk::ManagementReply::ReplicasChanged { .. },
                             )),
                         ..
-                    }) => return Ok(()),
+                    }) => {
+                        acknowledged_through
+                            .fetch_max(receipt.selector.decision_sequence, Ordering::SeqCst);
+                        return Ok(());
+                    }
                     Ok(CleanManagementSubmission::CommitteeTransition { stable, .. }) => {
                         last = format!("committee leg pending (stable={stable})");
                     }
