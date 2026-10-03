@@ -2533,27 +2533,40 @@ fn candidate_shared_agent_create_install_invoke_reopens_without_test_finality() 
         let prepared = response.for_request(&preparation).unwrap();
         assert_eq!(prepared.profile(), AgentProfile::Shared);
         let work = prepared.work().clone();
-        let authorization = InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(
-            &work,
-            prepared.observed_slot(),
-        ));
+        // The host's own method policy decides whether an unsigned preflight
+        // is admissible; never construct one for a non-Public method.
+        let preflight = prepared.public_preflight().unwrap_or_else(|| {
+            panic!(
+                "catalog page is not a Public method: {:?}",
+                prepared.selected_method()
+            )
+        });
+        assert_eq!(
+            preflight,
+            PublicPreflight::for_work(&work, prepared.observed_slot())
+        );
+        let authorization = InvocationAuthorization::PublicPreflight(preflight);
         let request = AgentInvocationRequest::new(
             RuntimeExecutionContext::Direct,
             work.clone(),
             authorization.clone(),
         )
         .unwrap();
-        let AgentInvocationResponse::Direct {
-            outcome: RuntimeOutcome::Completed(Ok(reply)),
-            ..
-        } = dispatch_encoded_invocation(
+        let response = dispatch_encoded_invocation(
             &supervisor,
             supervisor.snapshot(key).unwrap(),
             &request.encode().unwrap(),
         )
-        .unwrap()
-        else {
-            panic!("public Shared Query must complete directly");
+        .unwrap_or_else(|error| panic!("public Shared Query dispatch failed: {error:?}"));
+        let reply = match response {
+            AgentInvocationResponse::Direct {
+                outcome: RuntimeOutcome::Completed(Ok(reply)),
+                ..
+            } => reply,
+            other => panic!(
+                "public Shared Query must complete directly; mode={:?} actor={:?} response={other:?}",
+                work.mode, work.actor
+            ),
         };
         assert_eq!(reply.status, InvocationStatus::Done);
         assert!(!reply.reply.is_empty());
