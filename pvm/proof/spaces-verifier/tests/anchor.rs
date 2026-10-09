@@ -40,11 +40,13 @@ impl frame_system::Config for Test {
 
 parameter_types! {
     pub const Standard: VosPolicy = VosPolicy::Standard;
+    pub const SpacesPalletId: frame_support::PalletId = frame_support::PalletId(*b"fc/space");
 }
 
 type Verifier = VosVerifier<Standard, ConstU8<18>>;
 
 impl pallet_spaces::Config for Test {
+    type PalletId = SpacesPalletId;
     type SpaceId = u32;
     type BindKey = u32;
     type CreateOrigin = EnsureSigned<u64>;
