@@ -1233,7 +1233,7 @@ dependencies = [
 [[package]]
 name = "fc-pallet-spaces"
 version = "3.0.0-pre.2"
-source = "git+https://github.com/virto-network/frame-contrib?branch=pallet-spaces#a5378f55cfbbd97c51b5813c7da994e6ea22df4c"
+source = "git+https://github.com/virto-network/frame-contrib?branch=pallet-spaces#cd3b8f274fa0090f045398e53bf07c7bd3be922c"
 dependencies = [
  "frame-benchmarking",
  "frame-support",
