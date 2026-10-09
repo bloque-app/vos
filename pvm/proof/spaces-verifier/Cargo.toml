@@ -1,0 +1,52 @@
+# VOS's STARK verifier as a backend for Kreivo Spaces (`fc-pallet-spaces` in frame-contrib).
+#
+# frame-contrib holds the Substrate side (the pallet and its `ProofVerifier` trait) and is the
+# source of truth for the trait; this crate implements it with `vos-pvm-proof-verifier`. A runtime
+# adds this crate and sets the pallet's `Config::Verifier` to `VosVerifier<Policy, MaxLogSize>`.
+#
+# Its OWN `[workspace]` (and in the vos root `exclude` list), as `settlement-verifier` is, so its
+# no_std feature resolution never co-resolves with the prover workspace.
+[package]
+name = "vos-spaces-verifier"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "VOS's STARK verifier as a ProofVerifier backend for fc-pallet-spaces"
+publish = false
+
+[workspace]
+
+[dependencies]
+# The Substrate side. Branch `pallet-spaces` until the pallet is released.
+fc-pallet-spaces = { git = "https://github.com/virto-network/frame-contrib", branch = "pallet-spaces", default-features = false }
+frame-support = { version = "48.1.0", default-features = false }
+
+vos-pvm-proof-verifier = { path = "../verifier", default-features = false }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+sp-io = { version = "48.0.0", default-features = false }
+# stwo -> starknet-crypto -> starknet-ff pulls getrandom 0.2, which refuses `wasm32v1-none` unless
+# the embedder registers a source (`custom`; registered in `lib.rs`). Verification never draws
+# randomness.
+getrandom = { version = "0.2", default-features = false, features = ["custom"] }
+
+[dev-dependencies]
+codec = { package = "parity-scale-codec", version = "3.6.12", features = ["derive"] }
+frame-system = { version = "48.0.0" }
+scale-info = { version = "2.11.6", features = ["derive"] }
+
+[features]
+default = ["std"]
+std = [
+	"fc-pallet-spaces/std",
+	"frame-support/std",
+	"getrandom/std",
+	"sp-io/std",
+]
+
+# Stwo at the verifier's revision with `dashmap` (std-only, prover-only) made optional, so a
+# feature-less Stwo is `no_std` and builds for `wasm32v1-none`: the fork `settlement-verifier`
+# already pins. A runtime that links this crate needs the same `[patch]` at its workspace root (the
+# wasm builder copies it into the runtime's wasm project).
+[patch."https://github.com/starkware-libs/stwo"]
+stwo = { git = "https://github.com/olanod/stwo", rev = "6df2fb305182bf9d0f77890215a5692affb8748e" }
+stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "6df2fb305182bf9d0f77890215a5692affb8748e" }

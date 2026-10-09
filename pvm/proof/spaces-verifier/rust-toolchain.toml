@@ -1,0 +1,5 @@
+[toolchain]
+# A runtime's toolchain, not VOS's prover nightly: polkadot-sdk's wasm builder targets
+# `wasm32v1-none`, which needs Rust 1.84 or later.
+channel = "1.91"
+targets = ["wasm32v1-none"]

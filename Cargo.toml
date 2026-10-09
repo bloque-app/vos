@@ -51,6 +51,9 @@ exclude = [
     # co-resolves with the prover workspace (which would drag blst/rayon) — that
     # isolation is what makes it buildable for wasm32/PVM.
     "pvm/proof/settlement-verifier",
+    # The Kreivo Spaces backend (`fc-pallet-spaces`'s `ProofVerifier`): its OWN `[workspace]` for
+    # the same reason, and because it pulls polkadot-sdk crates the vos workspace does not.
+    "pvm/proof/spaces-verifier",
 ]
 
 [workspace.package]
